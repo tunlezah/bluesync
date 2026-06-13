@@ -1,0 +1,230 @@
+.eq-tab {
+  gap: var(--spacing-md);
+}
+
+/* Loading / unavailable */
+.eq-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: var(--spacing-xl);
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+.eq-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: var(--spacing-xl) var(--spacing-lg);
+  text-align: center;
+}
+
+.eq-unavailable__icon {
+  font-size: 3rem;
+  color: var(--color-text-dim);
+}
+
+.eq-unavailable__title {
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--color-text-muted);
+}
+
+.eq-unavailable__hint {
+  font-size: 0.875rem;
+  color: var(--color-text-dim);
+  line-height: 1.5;
+}
+
+/* Header */
+.eq-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.eq-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.eq-toggle__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.eq-toggle__track {
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--color-border);
+  display: inline-block;
+  position: relative;
+  transition: background 0.2s;
+}
+
+.eq-toggle__track::after {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  top: 3px;
+  left: 3px;
+  transition: transform 0.2s;
+}
+
+.eq-toggle__input:checked ~ .eq-toggle__track {
+  background: var(--color-accent);
+}
+
+.eq-toggle__input:checked ~ .eq-toggle__track::after {
+  transform: translateX(18px);
+}
+
+.eq-toggle__label {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  font-weight: 500;
+  min-width: 40px;
+}
+
+.eq-header__actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.eq-action-btn {
+  padding: 6px 12px;
+  font-size: 0.8125rem;
+}
+
+/* Presets dropdown */
+.eq-presets-wrap {
+  position: relative;
+}
+
+.eq-presets-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  min-width: 140px;
+  z-index: 200;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+  overflow: hidden;
+}
+
+.eq-presets-menu__item {
+  display: block;
+  width: 100%;
+  padding: 9px 14px;
+  font-size: 0.875rem;
+  color: var(--color-text);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s;
+}
+
+.eq-presets-menu__item:hover {
+  background: var(--color-card-hover);
+}
+
+/* Frequency response curve */
+.eq-curve-card {
+  padding: var(--spacing-sm);
+}
+
+.eq-curve {
+  width: 100%;
+  height: 80px;
+  display: block;
+}
+
+/* Sliders */
+.eq-sliders-card {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+.eq-sliders-card--bypassed {
+  opacity: 0.5;
+}
+
+.eq-sliders {
+  flex: 1;
+  display: flex;
+  gap: 4px;
+  justify-content: space-between;
+  align-items: flex-end;
+  height: 180px;
+}
+
+.eq-sliders__scale {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--color-text-dim);
+  padding: 0 2px;
+  height: 180px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+/* Individual slider */
+.eq-slider {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  height: 100%;
+}
+
+.eq-slider__gain {
+  font-size: 0.65rem;
+  color: var(--color-accent);
+  font-variant-numeric: tabular-nums;
+  min-height: 14px;
+  line-height: 1;
+}
+
+.eq-slider__track {
+  /* Vertical range input cross-browser */
+  writing-mode: vertical-lr;
+  direction: rtl;
+  appearance: slider-vertical;
+  -webkit-appearance: slider-vertical;
+  width: 18px;
+  flex: 1;
+  cursor: pointer;
+  accent-color: var(--color-accent);
+  background: transparent;
+}
+
+.eq-slider__track:disabled {
+  cursor: not-allowed;
+}
+
+.eq-slider__freq {
+  font-size: 0.65rem;
+  color: var(--color-text-dim);
+  text-align: center;
+  line-height: 1;
+}

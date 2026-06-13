@@ -1,0 +1,17 @@
+[Unit]
+Description=SoundSync — pin Bluetooth adapter Class-of-Device to audio speaker
+Documentation=file:///usr/share/doc/soundsync/audio-routing-nuances.md
+# Must follow bluetoothd; tied to its lifecycle so it stops/restarts with it.
+After=bluetooth.service
+Requires=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+Type=simple
+# hciconfig needs CAP_NET_ADMIN — runs as root (system service).
+ExecStart=/usr/lib/soundsync/soundsync-cod-watch.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=bluetooth.target

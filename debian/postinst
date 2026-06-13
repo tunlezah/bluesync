@@ -1,0 +1,45 @@
+#!/bin/sh
+# SoundSync postinst — run by dpkg after package installation.
+set -e
+
+case "$1" in
+    configure)
+        # Apply WirePlumber A2DP config (root, best-effort).
+        if /usr/bin/soundsync apply-wireplumber-config; then
+            echo "soundsync: WirePlumber A2DP config applied."
+        else
+            echo "soundsync: WARNING — apply-wireplumber-config failed." \
+                 "Re-run after ensuring pipewire + wireplumber are installed." >&2
+        fi
+
+        # Reload systemd so the new unit files are visible.
+        systemctl daemon-reload || true
+
+        # Enable the root oneshot adapter-setup unit.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper enable soundsync-adapter.service || true
+        fi
+        # If we are running inside a live system (not a chroot), start it now.
+        if systemctl is-system-running --quiet 2>/dev/null; then
+            systemctl enable --now soundsync-adapter.service || true
+        fi
+
+        # Enable the user daemon unit for all future user sessions (global enable).
+        systemctl --global enable soundsync.service || true
+
+        echo "soundsync: installation complete."
+        echo "  - The adapter-setup unit runs at boot (system service)."
+        echo "  - The daemon starts automatically in each user session."
+        echo "  - Log out/in or run: systemctl --user start soundsync"
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

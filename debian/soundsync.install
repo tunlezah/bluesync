@@ -1,0 +1,4 @@
+target/release/soundsync                              usr/bin/
+webui/dist/*                                           usr/share/soundsync/webui/
+packaging/systemd/soundsync.service                    usr/lib/systemd/user/
+packaging/systemd/soundsync-adapter.service            usr/lib/systemd/system/

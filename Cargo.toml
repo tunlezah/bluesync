@@ -1,0 +1,38 @@
+[package]
+name = "soundsync"
+version = "0.0.1"
+edition = "2021"
+description = "Bluetooth A2DP sink with DSP EQ and WebRTC streaming (rebuild)"
+license = "MIT"
+
+[lib]
+name = "soundsync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "soundsync"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros", "io-util", "signal", "net"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+opus = "0.3"
+rustfft = "6"
+uuid = { version = "1", features = ["v4"] }
+webrtc = "0.12"
+rtp = "0.12"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+prost = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+futures = "0.3"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+dbus = "0.9"
+dbus-tokio = "0.7"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

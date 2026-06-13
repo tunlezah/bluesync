@@ -1,0 +1,28 @@
+#!/bin/sh
+# SoundSync prerm — run by dpkg before package removal.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure|failed-upgrade)
+        # Disable user unit globally (best-effort).
+        systemctl --global disable soundsync.service 2>/dev/null || true
+
+        # Stop + disable the system adapter unit (best-effort).
+        if systemctl is-enabled soundsync-adapter.service >/dev/null 2>&1; then
+            systemctl disable --now soundsync-adapter.service || true
+        else
+            systemctl stop soundsync-adapter.service 2>/dev/null || true
+        fi
+
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper disable soundsync-adapter.service || true
+        fi
+        ;;
+
+    *)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

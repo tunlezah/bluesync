@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+# SoundSync debian/rules — debhelper 13 + cargo + npm
+# Note: if node/npm are not on PATH as system commands, set SOUNDSYNC_NODE_BIN
+# in the build environment, or supply a pre-built webui/dist and pass DH_CARGO_NODEP=1.
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+	# Detect node: prefer SOUNDSYNC_NODE_BIN, fall back to ~/.local/node/bin, then PATH
+	if [ -n "$(SOUNDSYNC_NODE_BIN)" ]; then \
+		export PATH="$(SOUNDSYNC_NODE_BIN):$$PATH"; \
+	elif [ -d "$$HOME/.local/node/bin" ]; then \
+		export PATH="$$HOME/.local/node/bin:$$PATH"; \
+	fi; \
+	cd webui && npm ci && npm run build
+
+override_dh_auto_install:
+	# Files are declared in soundsync.install; dh_install handles placement.
+	dh_install
+
+override_dh_auto_test:
+	cargo test --release

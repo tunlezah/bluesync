@@ -1,0 +1,214 @@
+.card-section-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-dim);
+  margin-bottom: var(--spacing-sm);
+}
+
+/* Health */
+.health-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.health-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 0.875rem;
+}
+
+.health-row:last-child {
+  border-bottom: none;
+}
+
+.health-row__label {
+  color: var(--color-text-muted);
+}
+
+.health-row__value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Theme picker */
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-section__title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.settings-section__soon {
+  font-size: 0.875rem;
+  color: var(--color-text-dim);
+  font-style: italic;
+}
+
+.theme-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.theme-row__label {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+/* Segmented control */
+.theme-seg {
+  display: flex;
+  background: var(--color-card-hover);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.theme-seg__btn {
+  padding: 6px 12px;
+  font-size: 0.8125rem;
+  color: var(--color-text-dim);
+  border: none;
+  background: none;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.theme-seg__btn:hover {
+  background: var(--color-card-active);
+  color: var(--color-text-muted);
+}
+
+.theme-seg__btn--active {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+/* Accent swatches */
+.accent-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.accent-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform 0.15s, border-color 0.15s;
+}
+
+.accent-swatch:hover {
+  transform: scale(1.1);
+}
+
+.accent-swatch--active {
+  border-color: var(--color-text);
+  transform: scale(1.15);
+}
+
+/* Stream links */
+.stream-links__hint {
+  font-size: 0.8125rem;
+  color: var(--color-text-dim);
+  margin-bottom: var(--spacing-sm);
+  line-height: 1.5;
+}
+
+.stream-links-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stream-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  background: var(--color-card-hover);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+}
+
+.stream-link__label {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  min-width: 72px;
+  flex-shrink: 0;
+}
+
+.stream-link__url {
+  flex: 1;
+  font-size: 0.8125rem;
+  font-family: var(--font-mono);
+  color: var(--color-accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stream-link__copy {
+  padding: 4px 10px;
+  font-size: 0.8125rem;
+  flex-shrink: 0;
+}
+
+/* Rename */
+.rename-row {
+  display: flex;
+  gap: 8px;
+}
+
+.rename-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--color-card-hover);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+  color: var(--color-text);
+  transition: border-color 0.15s;
+}
+
+.rename-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+.rename-input::placeholder {
+  color: var(--color-text-dim);
+}
+
+.rename-btn {
+  padding: 8px 16px;
+  flex-shrink: 0;
+}
+
+/* Admin */
+.admin-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-btn {
+  font-size: 0.875rem;
+}

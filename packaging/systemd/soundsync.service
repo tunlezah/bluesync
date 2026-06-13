@@ -1,0 +1,21 @@
+[Unit]
+Description=SoundSync — Bluetooth A2DP sink with DSP EQ + web UI
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=/usr/bin/soundsync
+Environment=SOUNDSYNC_WEB_DIR=/usr/share/soundsync/webui
+Environment=SOUNDSYNC_BIND=0.0.0.0:8080
+Restart=always
+RestartSec=2
+# Graceful-shutdown budget (W0.2). Must stay strictly GREATER than the app's
+# internal hard-exit backstop (8s, SOUNDSYNC_SHUTDOWN_TIMEOUT) so the process
+# exits cleanly before systemd escalates to SIGKILL.
+TimeoutStopSec=15
+# Send SIGTERM to the main process first; only escalate to the whole control
+# group if it doesn't exit within TimeoutStopSec.
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

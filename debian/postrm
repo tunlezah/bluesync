@@ -1,0 +1,28 @@
+#!/bin/sh
+# SoundSync postrm — run by dpkg after package removal.
+set -e
+
+WP_CONF=/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf
+WP_LUA=/etc/wireplumber/wireplumber.conf.d/51-soundsync.lua.d
+
+case "$1" in
+    purge)
+        # Remove the WirePlumber config written at install time.
+        rm -f  "$WP_CONF"
+        rm -rf "$WP_LUA"
+        echo "soundsync: WirePlumber config purged."
+        echo "NOTE: per-user data in ~/.config/soundsync/ is NOT removed."
+        systemctl daemon-reload || true
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        systemctl daemon-reload || true
+        ;;
+
+    *)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

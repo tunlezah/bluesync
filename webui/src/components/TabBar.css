@@ -1,0 +1,113 @@
+.tab-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--tab-height);
+  display: flex;
+  align-items: center;
+  background: var(--color-bg-elevated);
+  border-top: 1px solid var(--color-border);
+  z-index: 100;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  padding: 0 4px;
+}
+
+.tab-bar__item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 4px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-dim);
+  transition: color var(--transition-ui), background var(--transition-ui);
+  position: relative;
+}
+
+.tab-bar__item:hover {
+  color: var(--color-text-muted);
+  background: var(--color-card-hover);
+}
+
+.tab-bar__item--active {
+  color: var(--color-accent);
+}
+
+.tab-bar__item--active::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 2px;
+  background: var(--color-accent);
+  border-radius: 0 0 2px 2px;
+}
+
+.tab-bar__icon {
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.tab-bar__label {
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.tab-bar__ws-dot {
+  position: absolute;
+  right: 10px;
+  bottom: 12px;
+}
+
+/* Desktop: horizontal nav at top instead */
+@media (min-width: 600px) {
+  .tab-bar {
+    position: static;
+    height: 48px;
+    border-top: none;
+    border-bottom: 1px solid var(--color-border);
+    flex-direction: row;
+    padding: 0 var(--spacing-md);
+    gap: 4px;
+  }
+
+  .tab-bar__item {
+    flex: none;
+    flex-direction: row;
+    gap: 6px;
+    padding: 8px 14px;
+  }
+
+  .tab-bar__item--active::before {
+    top: auto;
+    bottom: 0;
+    left: 50%;
+    width: 100%;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    transform: translateX(-50%);
+  }
+
+  .tab-bar__icon {
+    font-size: 1rem;
+  }
+
+  .tab-bar__label {
+    font-size: 0.8125rem;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .tab-bar__ws-dot {
+    position: static;
+    margin-left: auto;
+  }
+}

@@ -1,0 +1,45 @@
+Source: soundsync
+Section: sound
+Priority: optional
+Maintainer: SoundSync Maintainers <soundsync@example.com>
+# Build-Depends note: this host uses ~/.local/node — the .deb build assumes a
+# system node (or a pre-vendored webui/dist supplied via --no-build path).
+# For cross-compilation, ensure node/npm are on PATH before invoking dpkg-buildpackage.
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               cmake,
+               pkg-config,
+               libdbus-1-dev,
+               libopus-dev,
+               nodejs,
+               npm
+Standards-Version: 4.6.2
+Homepage: https://github.com/tunlezah/sc-next
+Rules-Requires-Root: no
+
+Package: soundsync
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         pipewire,
+         pipewire-pulse,
+         pipewire-audio,
+         wireplumber,
+         libspa-0.2-bluetooth,
+         pulseaudio-utils,
+         ffmpeg,
+         bluez,
+         bluez-tools,
+         avahi-daemon,
+         avahi-utils,
+         rfkill,
+         dbus-bin,
+         libdbus-1-3
+Description: Bluetooth A2DP sink with DSP EQ and web UI
+ SoundSync turns a headless Linux box into a Bluetooth A2DP audio sink
+ with a DSP equaliser and a browser-accessible control interface.
+ .
+ The daemon runs as a systemd user service inside the PipeWire session.
+ A root oneshot service sets the Bluetooth adapter Class-of-Device and
+ HCI name at boot (requires CAP_NET_ADMIN via hciconfig).
