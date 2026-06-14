@@ -1,3 +1,4 @@
+use soundsync::adapter_id::resolve_adapter;
 use soundsync::audio::capture::new_pcm_bus;
 use soundsync::audio::eq_controller::{run_eq_controller, EqCommand, EqControllerConfig};
 use soundsync::audio::spectrum::run_spectrum;
@@ -435,30 +436,6 @@ async fn main() {
             }
         }
     }
-}
-
-/// Resolve the Bluetooth adapter index (no hardcoded `hci0` assumption):
-/// `SOUNDSYNC_HCI` if set and non-empty, else the first `/sys/class/bluetooth/hci*`
-/// (sorted), else `hci0` as a last resort.
-fn resolve_adapter() -> String {
-    if let Ok(h) = std::env::var("SOUNDSYNC_HCI") {
-        let h = h.trim();
-        if !h.is_empty() {
-            return h.to_string();
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir("/sys/class/bluetooth") {
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.starts_with("hci"))
-            .collect();
-        names.sort();
-        if let Some(first) = names.into_iter().next() {
-            return first;
-        }
-    }
-    "hci0".to_string()
 }
 
 /// Default hard-shutdown backstop. Must stay strictly below the unit's

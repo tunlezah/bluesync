@@ -81,13 +81,13 @@ Build the package (requires system `node`, `npm`, `cargo`, `debhelper`):
 ```sh
 # From the repo root (NOT from packaging/):
 dpkg-buildpackage -us -uc -b
-sudo apt install ../soundsync_0.0.1_amd64.deb
+sudo apt install ../soundsync_*_amd64.deb
 ```
 
 Or install a pre-built `.deb`:
 
 ```sh
-sudo apt install ./soundsync_0.0.1_*.deb
+sudo apt install ./soundsync_*_amd64.deb
 ```
 
 > **Note for this host (no system node):** Set `SOUNDSYNC_NODE_BIN=~/.local/node/bin`

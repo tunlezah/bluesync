@@ -11,8 +11,15 @@
 # box has zero or several such accounts, the auto-detect is skipped and you
 # must name the appliance user here.
 #
-# Uncomment and set USER to the appliance user, e.g.:
-#USER=mark
+# Uncomment and set SOUNDSYNC_USER to the appliance user, e.g.:
+#SOUNDSYNC_USER=mark
+#
+# NOTE: the variable is deliberately named SOUNDSYNC_USER (not USER). The
+# postinst runs under "sudo apt install", where the ambient $USER is "root";
+# a plain USER= here would be indistinguishable from that inherited value and
+# would wrongly pin the appliance to root. SOUNDSYNC_USER cannot collide with
+# any ambient environment variable, so when it is left unset the postinst
+# falls through to the sole-human auto-detect instead of selecting root.
 #
 # After editing, run:   sudo dpkg-reconfigure soundsync
 #   (or)                sudo loginctl enable-linger <user>

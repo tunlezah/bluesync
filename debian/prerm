@@ -3,7 +3,14 @@
 set -e
 
 case "$1" in
-    remove|upgrade|deconfigure|failed-upgrade)
+    remove|deconfigure)
+        # G12: act ONLY on remove|deconfigure — NOT on upgrade/failed-upgrade.
+        # On an upgrade the units must keep running (stopping the CoD watcher
+        # mid-upgrade lets the adapter drift off its audio CoD), and the new
+        # postinst reconciles unit state. Tearing units down here on every
+        # upgrade also double-manages the user unit against postinst's
+        # re-enable. So upgrade/failed-upgrade fall through to the default no-op.
+
         # Disable user unit globally (best-effort).
         systemctl --global disable soundsync.service 2>/dev/null || true
 

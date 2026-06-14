@@ -2,14 +2,18 @@
 # SoundSync postrm — run by dpkg after package removal.
 set -e
 
-WP_CONF=/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf
-WP_LUA=/etc/wireplumber/wireplumber.conf.d/51-soundsync.lua.d
-
 case "$1" in
     purge)
-        # Remove the WirePlumber config written at install time.
-        rm -f  "$WP_CONF"
-        rm -rf "$WP_LUA"
+        # Remove the WirePlumber config written at install time (G6).
+        # The binary writes one of two real paths depending on WP version:
+        #   0.5+  : /etc/wireplumber/wireplumber.conf.d/51-soundsync.conf
+        #   0.4.x : /etc/wireplumber/bluetooth.lua.d/51-soundsync-a2dp.lua
+        # (see src/wireplumber/apply.rs / config.rs). The old code targeted a
+        # bogus directory (.../wireplumber.conf.d/51-soundsync.lua.d) the binary
+        # never writes, orphaning the real 0.4.x Lua config. Purge the real
+        # superset, mirroring install.sh --reset.
+        rm -f /etc/wireplumber/wireplumber.conf.d/51-soundsync*.conf || true
+        rm -f /etc/wireplumber/bluetooth.lua.d/51-soundsync* || true
         echo "soundsync: WirePlumber config purged."
         echo "NOTE: per-user data in ~/.config/soundsync/ is NOT removed."
         systemctl daemon-reload || true

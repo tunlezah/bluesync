@@ -1,3 +1,27 @@
+soundsync (0.0.3) unstable; urgency=medium
+
+  * Installer-robustness fixes (see research/installer-readiness-2026-06-14.md):
+  * G1 (critical): the appliance-user conffile variable is renamed from USER to
+    SOUNDSYNC_USER. The old USER= name collided with the ambient $USER (which is
+    "root" under "sudo apt install"); postinst now parses SOUNDSYNC_USER= from
+    /etc/default/soundsync textually (no shell sourcing), so an untouched
+    conffile yields an empty SS_USER and the sole-human auto-detect runs instead
+    of pinning linger to root and killing the headless daemon at boot.
+  * G6: postinst purge now removes the WirePlumber config paths the binary
+    actually writes (wireplumber.conf.d/51-soundsync*.conf and
+    bluetooth.lua.d/51-soundsync*) instead of a bogus .lua.d directory, so the
+    0.4.x Lua config is no longer orphaned on purge.
+  * G12: prerm now acts only on remove|deconfigure, not on upgrade. Upgrades no
+    longer stop the Class-of-Device watcher mid-upgrade or double-manage the
+    user unit; postinst reconciles unit state.
+  * G11: add pipewire-bin (pw-cat/pw-cli/pw-link/pw-metadata/pw-loopback) and
+    curl to Depends; previously present only transitively.
+  * N13: replace the 'systemctl is-system-running --quiet' guard (which
+    false-negatives on a degraded system) with the dh-standard
+    '[ -d /run/systemd/system ]' chroot guard when starting the system units.
+
+ -- SoundSync Maintainers <soundsync@example.com>  Sun, 14 Jun 2026 12:00:00 +0000
+
 soundsync (0.0.2) unstable; urgency=medium
 
   * Ship + enable the Class-of-Device watcher unit in the .deb so the adapter

@@ -19,8 +19,12 @@ case "$1" in
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper enable soundsync-adapter.service || true
         fi
-        # If we are running inside a live system (not a chroot), start it now.
-        if systemctl is-system-running --quiet 2>/dev/null; then
+        # Start it now if we are running inside a live system (not a chroot).
+        # N13: use the dh-standard chroot guard '[ -d /run/systemd/system ]'
+        # rather than 'is-system-running --quiet', which returns non-zero on a
+        # 'degraded' system (a very common state) and would wrongly skip the
+        # start on an otherwise-live host.
+        if [ -d /run/systemd/system ]; then
             systemctl enable --now soundsync-adapter.service || true
         fi
 
@@ -29,8 +33,10 @@ case "$1" in
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper enable soundsync-adapter-cod.service || true
         fi
-        # If we are running inside a live system (not a chroot), start it now.
-        if systemctl is-system-running --quiet 2>/dev/null; then
+        # Start it now if we are running inside a live system (not a chroot).
+        # N13: dh-standard chroot guard (see note above) instead of
+        # 'is-system-running --quiet' which false-negatives on 'degraded'.
+        if [ -d /run/systemd/system ]; then
             systemctl enable --now soundsync-adapter-cod.service || true
         fi
 
@@ -46,15 +52,22 @@ case "$1" in
         # user's WirePlumber so it picks up the A2DP config written above.
         #
         # Resolve SS_USER:
-        #   1. an explicit USER= in /etc/default/soundsync, else
+        #   1. an explicit SOUNDSYNC_USER= in /etc/default/soundsync, else
         #   2. auto-detect the SOLE human login account (exactly one passwd
         #      entry with uid in [1000,65534) and a real login shell).
         # If zero or several candidates exist, SS_USER stays empty and we print
         # a remediation note instead of guessing.
+        #
+        # CRITICAL (G1): do NOT source the conffile and read $USER. Under
+        # "sudo apt install" the ambient $USER is "root", so a sourced/unset
+        # USER would leak root into SS_USER and skip the auto-detect, pinning
+        # linger to root and killing the headless daemon. We instead parse the
+        # SOUNDSYNC_USER= assignment textually (no shell sourcing, no env
+        # inheritance), so an untouched conffile yields an EMPTY SS_USER and
+        # the sole-human auto-detect below runs.
         SS_USER=""
         if [ -r /etc/default/soundsync ]; then
-            # shellcheck disable=SC1091
-            SS_USER="$( . /etc/default/soundsync 2>/dev/null; printf '%s' "${USER:-}" )" || true
+            SS_USER="$(sed -n 's/^[[:space:]]*SOUNDSYNC_USER=//p' /etc/default/soundsync 2>/dev/null | tail -1 | tr -d "\"'")" || true
         fi
         if [ -z "$SS_USER" ]; then
             SS_USER="$(
@@ -96,7 +109,7 @@ case "$1" in
             fi
         else
             echo "soundsync: could not determine the appliance user automatically." >&2 || true
-            echo "  Set USER=<name> in /etc/default/soundsync then run" \
+            echo "  Set SOUNDSYNC_USER=<name> in /etc/default/soundsync then run" \
                  "'sudo dpkg-reconfigure soundsync'," >&2 || true
             echo "  or run 'sudo loginctl enable-linger <user>' so the headless" \
                  "daemon starts at boot." >&2 || true

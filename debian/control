@@ -23,6 +23,7 @@ Architecture: any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          pipewire,
+         pipewire-bin,
          pipewire-pulse,
          pipewire-audio,
          wireplumber,
@@ -35,7 +36,8 @@ Depends: ${shlibs:Depends},
          avahi-utils,
          rfkill,
          dbus-bin,
-         libdbus-1-3
+         libdbus-1-3,
+         curl
 Description: Bluetooth A2DP sink with DSP EQ and web UI
  SoundSync turns a headless Linux box into a Bluetooth A2DP audio sink
  with a DSP equaliser and a browser-accessible control interface.

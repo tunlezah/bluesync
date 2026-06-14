@@ -20,6 +20,46 @@ pub fn detect_config_format<R: CommandRunner>(runner: &R) -> ConfigFormat {
     }
 }
 
+/// Like [`detect_config_format`], but when `wireplumber --version` is unreadable
+/// (spawn failure, non-zero exit, or unparseable banner) it does NOT hard-assume
+/// Lua. Instead it inspects BOTH candidate on-disk config paths and prefers the
+/// format whose file actually exists, so a momentarily-unreachable WirePlumber
+/// cannot drive a false FAIL by making doctor expect the wrong path (G10).
+///
+/// Resolution order:
+/// 1. If the version parses, trust it (authoritative — matches the writer).
+/// 2. Else if exactly one candidate config file exists on disk, use that format.
+/// 3. Else fall back to Lua (the original conservative default).
+///
+/// This is read-only and used by `soundsync doctor`; the install/write path
+/// continues to use [`detect_config_format`] (where Lua is the safe default).
+pub fn detect_config_format_guarded<R: CommandRunner, F: Fs>(runner: &R, fs: &F) -> ConfigFormat {
+    if let Ok(out) = runner.run("wireplumber", &["--version"]) {
+        if let Some(v) = WpVersion::parse(&out.stdout).or_else(|| WpVersion::parse(&out.stderr)) {
+            return v.config_format();
+        }
+    }
+    // Version unreadable: probe both candidate paths before assuming a format.
+    let spa = generate_path(ConfigFormat::SpaJson);
+    let lua = generate_path(ConfigFormat::Lua);
+    let spa_present = fs.read_to_string(&spa).is_ok();
+    let lua_present = fs.read_to_string(&lua).is_ok();
+    match (spa_present, lua_present) {
+        (true, false) => ConfigFormat::SpaJson,
+        (false, true) => ConfigFormat::Lua,
+        // Neither present (nothing to disambiguate) or both present (ambiguous):
+        // keep the original conservative Lua default.
+        _ => ConfigFormat::Lua,
+    }
+}
+
+/// Full `dir/filename` path the writer would use for `format` (oracle:
+/// `wireplumber::config::generate`).
+fn generate_path(format: ConfigFormat) -> String {
+    let cfg = crate::wireplumber::config::generate(format);
+    format!("{}/{}", cfg.etc_dir, cfg.filename)
+}
+
 /// Read and parse `/etc/os-release`; returns the default (all-None) on failure.
 pub fn detect_os_release<F: Fs>(fs: &F) -> OsRelease {
     fs.read_to_string(OS_RELEASE_PATH)
@@ -90,6 +130,54 @@ mod tests {
             },
         );
         assert_eq!(detect_config_format(&r), ConfigFormat::SpaJson);
+    }
+
+    // ── detect_config_format_guarded (G10 probe guard) ──────────────────────
+
+    const SPA_PATH: &str = "/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf";
+    const LUA_PATH: &str = "/etc/wireplumber/bluetooth.lua.d/51-soundsync-a2dp.lua";
+
+    #[test]
+    fn guarded_trusts_parseable_version_over_disk() {
+        // Version parses as 0.5 → SpaJson, even though a stale Lua file is present.
+        let r = wp("wireplumber 0.5.2");
+        let fs = FakeFs::new().with_file(LUA_PATH, "-- stale");
+        assert_eq!(detect_config_format_guarded(&r, &fs), ConfigFormat::SpaJson);
+    }
+
+    #[test]
+    fn guarded_prefers_existing_spa_file_when_version_unreadable() {
+        // wireplumber missing entirely; only the SPA-JSON file exists on disk.
+        let r = FakeCommandRunner::new().with_error("wireplumber");
+        let fs = FakeFs::new().with_file(SPA_PATH, "# config");
+        assert_eq!(
+            detect_config_format_guarded(&r, &fs),
+            ConfigFormat::SpaJson,
+            "must not hard-assume Lua when the SPA file is the one on disk"
+        );
+    }
+
+    #[test]
+    fn guarded_prefers_existing_lua_file_when_version_unreadable() {
+        let r = FakeCommandRunner::new(); // status 127, empty output → unreadable
+        let fs = FakeFs::new().with_file(LUA_PATH, "-- config");
+        assert_eq!(detect_config_format_guarded(&r, &fs), ConfigFormat::Lua);
+    }
+
+    #[test]
+    fn guarded_falls_back_to_lua_when_unreadable_and_no_file() {
+        let r = FakeCommandRunner::new().with_error("wireplumber");
+        let fs = FakeFs::new();
+        assert_eq!(detect_config_format_guarded(&r, &fs), ConfigFormat::Lua);
+    }
+
+    #[test]
+    fn guarded_ambiguous_both_present_keeps_lua_default() {
+        let r = FakeCommandRunner::new().with_error("wireplumber");
+        let fs = FakeFs::new()
+            .with_file(SPA_PATH, "# config")
+            .with_file(LUA_PATH, "-- config");
+        assert_eq!(detect_config_format_guarded(&r, &fs), ConfigFormat::Lua);
     }
 
     #[test]

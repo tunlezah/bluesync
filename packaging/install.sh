@@ -85,12 +85,79 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# N11: systemd is a hard requirement — every mode shells out to systemctl/
+# loginctl. Fail with a clear message rather than a raw error at the first call.
+command -v systemctl >/dev/null || { echo 'error: SoundSync requires systemd.' >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# G16 + N16: read appliance config from the deb conffile if present.
+# We do NOT `source` it (that would let arbitrary assignments leak into the
+# script env); instead parse the four keys we honor. These influence the
+# adapter (SOUNDSYNC_HCI), the CoD comparison in doctor/reset (SOUNDSYNC_COD),
+# the bind port (SOUNDSYNC_BIND), and the appliance user (SOUNDSYNC_USER,
+# preferred over SUDO_USER below). Pre-set env wins over the conffile.
+# ---------------------------------------------------------------------------
+CONFFILE=/etc/default/soundsync
+_conf_get() {
+    # Print the value of KEY=... from $CONFFILE (last assignment wins),
+    # ignoring commented lines and stripping optional surrounding quotes.
+    [[ -r "$CONFFILE" ]] || return 0
+    sed -n "s/^[[:space:]]*$1=//p" "$CONFFILE" 2>/dev/null \
+        | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+if [[ -r "$CONFFILE" ]]; then
+    : "${SOUNDSYNC_USER:=$(_conf_get SOUNDSYNC_USER)}"
+    : "${SOUNDSYNC_HCI:=$(_conf_get SOUNDSYNC_HCI)}"
+    : "${SOUNDSYNC_COD:=$(_conf_get SOUNDSYNC_COD)}"
+    : "${SOUNDSYNC_BIND:=$(_conf_get SOUNDSYNC_BIND)}"
+fi
+# Honor SOUNDSYNC_HCI from the conffile in detect_hci (it reads the env).
+export SOUNDSYNC_HCI="${SOUNDSYNC_HCI:-}"
+# CoD to compare against (doctor/reset); default matches the CoD watcher.
+WANT_COD="${SOUNDSYNC_COD:-0x240414}"
+# Bind port: SOUNDSYNC_BIND may be "host:port" or bare "port"; take the port.
+if [[ -n "${SOUNDSYNC_BIND:-}" ]]; then
+    BIND_PORT="${SOUNDSYNC_BIND##*:}"
+fi
+
 # ---------------------------------------------------------------------------
 # Target user + helpers to act inside that user's PipeWire/D-Bus session.
 # The daemon is a systemd *user* service, so anything touching pipewire/
 # wireplumber/pactl/the user soundsync.service must run AS the user, not root.
 # ---------------------------------------------------------------------------
-TARGET_USER="${SUDO_USER:-}"
+# G5 + G16/N16: resolve the appliance user. Precedence:
+#   1. SOUNDSYNC_USER (env, or read from the conffile above)
+#   2. SUDO_USER (the human who ran `sudo install.sh`)
+#   3. auto-detect the SOLE human login account, the SAME way debian/postinst
+#      does (exactly one passwd uid in [1000,65534) with a real login shell).
+# This makes a raw-root invocation (su -, CI, cloud-init) target the real
+# appliance user instead of silently producing a dead appliance.
+TARGET_USER="${SOUNDSYNC_USER:-${SUDO_USER:-}}"
+if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
+    _candidates="$(
+        getent passwd 2>/dev/null | awk -F: '
+            $3 >= 1000 && $3 < 65534 &&
+            $7 != "/usr/sbin/nologin" && $7 != "/sbin/nologin" &&
+            $7 != "/bin/false" && $7 != "/usr/bin/false" && $7 != "" \
+            { print $1 }
+        '
+    )" || true
+    _ncand="$(printf '%s\n' "$_candidates" | grep -c . || true)"
+    if [[ "$_ncand" -eq 1 ]]; then
+        TARGET_USER="$_candidates"
+        echo "info: auto-detected appliance user '${TARGET_USER}' (sole human account)."
+    else
+        # Zero or several candidates: do NOT guess. Warn loudly so we never
+        # report "installed successfully" with a dead, user-less appliance.
+        echo "warn: could not determine the appliance user (${_ncand} candidate(s))." >&2
+        echo "      The user daemon, linger and WirePlumber restart will be SKIPPED." >&2
+        echo "      Set the appliance user and re-run, e.g.:" >&2
+        echo "        sudo SOUNDSYNC_USER=<user> $0" >&2
+        echo "        (or add 'SOUNDSYNC_USER=<user>' to ${CONFFILE})" >&2
+        TARGET_USER=""
+    fi
+fi
+
 TARGET_UID=""
 TARGET_HOME=""
 if [[ -n "$TARGET_USER" ]]; then
@@ -143,6 +210,19 @@ do_doctor() {
 
     echo "==> SoundSync doctor (target user: ${TARGET_USER})"
 
+    # -- install integrity (G9): a partial/broken install must FAIL loudly, not
+    #    let the "repairs" below silently no-op on missing files. --
+    [[ -x "$BINARY_DEST" ]] && ok "binary installed (${BINARY_DEST})" \
+        || fl "binary missing/not executable: ${BINARY_DEST}  (run: sudo $0)"
+    [[ -f "$WEBUI_DEST/index.html" ]] && ok "webui installed (${WEBUI_DEST}/index.html)" \
+        || fl "webui missing: ${WEBUI_DEST}/index.html  (run: sudo $0)"
+    local u; for u in "$USER_UNIT_DEST" "$SYSTEM_UNIT_DEST" "$COD_UNIT_DEST"; do
+        [[ -f "$u" ]] && ok "unit installed ($(basename "$u"))" \
+            || fl "unit file missing: $u  (run: sudo $0)"
+    done
+    [[ -x "$COD_SCRIPT_DEST" ]] && ok "CoD watcher script installed (${COD_SCRIPT_DEST})" \
+        || fl "CoD watcher script missing/not executable: ${COD_SCRIPT_DEST}  (run: sudo $0)"
+
     # -- binaries --
     local miss=() b
     for b in soundsync pactl wpctl hciconfig bluetoothctl dbus-monitor ffmpeg; do
@@ -175,12 +255,23 @@ do_doctor() {
     else wn "linger not enabled — enabling"; loginctl enable-linger "$TARGET_USER"; fi
 
     # -- WP A2DP config (the headless A2DP-sink fix) --
-    if [[ -f "$WP_CONF" ]] && grep -q 'seat-monitoring = disabled' "$WP_CONF"; then
-        ok "WP A2DP config present (seat-monitoring disabled)"
+    # G10: validate CONTENT, not just presence — assert seat-monitoring is
+    # disabled AND the A2DP sink role and codecs lines are present, so a config
+    # with a2dp_sink dropped/replaced or a missing codecs line does not pass.
+    if [[ -f "$WP_CONF" ]] \
+        && grep -q 'seat-monitoring = disabled' "$WP_CONF" \
+        && grep -q 'a2dp_sink' "$WP_CONF" \
+        && grep -qi 'codec' "$WP_CONF"; then
+        ok "WP A2DP config present (seat-monitoring disabled, a2dp_sink role + codecs)"
     else
         fl "WP A2DP config missing/incomplete — rewriting + reloading WP"
-        "$BINARY_DEST" apply-wireplumber-config >/dev/null 2>&1
-        run_user systemctl --user restart wireplumber
+        # G9: do NOT hide failures of the rewrite; report them.
+        if "$BINARY_DEST" apply-wireplumber-config; then
+            ok "re-applied WP A2DP config"
+        else
+            fl "apply-wireplumber-config failed (is wireplumber installed?)"
+        fi
+        run_user systemctl --user restart wireplumber 2>/dev/null || true
     fi
 
     # -- conflicting audio servers --
@@ -192,8 +283,8 @@ do_doctor() {
 
     # -- adapter Class-of-Device + speaker advertisement --
     local cod; cod="$(hciconfig "$(detect_hci)" class 2>/dev/null | grep -oE '0x[0-9a-fA-F]{6}' | head -1)"
-    [[ "$cod" == "0x240414" ]] && ok "adapter CoD = 0x240414 (Audio/Video speaker)" \
-        || wn "adapter CoD = ${cod:-unknown} — the CoD watcher should re-pin to 0x240414"
+    [[ "$cod" == "$WANT_COD" ]] && ok "adapter CoD = ${WANT_COD} (Audio/Video speaker)" \
+        || wn "adapter CoD = ${cod:-unknown} — the CoD watcher should re-pin to ${WANT_COD}"
     bluetoothctl show 2>/dev/null | grep -q '0000110b-0000-1000-8000-00805f9b34fb' \
         && ok "adapter advertises Audio Sink 0x110b (speaker is live)" \
         || fl "adapter NOT advertising 0x110b — source devices won't see a speaker"
@@ -202,6 +293,22 @@ do_doctor() {
     run_user pactl list short sinks 2>/dev/null | grep -q soundsync-capture \
         && ok "soundsync-capture sink present" \
         || wn "soundsync-capture sink absent (daemon may still be starting)"
+
+    # -- web UI bind/liveness (G17): "active" != "bound". If the user daemon is
+    #    active but the port doesn't answer, another process likely holds it
+    #    (soundsync then flaps on bind). Reuse the install-time holder detection.
+    #    Honors SOUNDSYNC_BIND via BIND_PORT. --
+    if run_user systemctl --user is-active --quiet soundsync.service; then
+        if run_user curl -s -o /dev/null "http://localhost:${BIND_PORT}/" 2>/dev/null; then
+            ok "web UI responding on port ${BIND_PORT}"
+        elif ss -tlnp 2>/dev/null | grep ":${BIND_PORT}" | grep -qv 'soundsync'; then
+            local holder
+            holder="$(ss -tlnp 2>/dev/null | grep ":${BIND_PORT}" | awk '{print $NF}' | head -1 || true)"
+            fl "port ${BIND_PORT} held by another process (${holder:-unknown}) — soundsync can't bind"
+        else
+            wn "web UI not responding on port ${BIND_PORT} (daemon may still be starting)"
+        fi
+    fi
 
     # -- latent: WP MemoryDenyWriteExecute (only matters for LDAC/aptX) --
     if run_user systemctl --user cat wireplumber.service 2>/dev/null | grep -q 'MemoryDenyWriteExecute=yes'; then
@@ -288,7 +395,7 @@ do_reset() {
     systemctl is-active --quiet soundsync-adapter-cod.service \
         && echo "      [OK] CoD watcher" || echo "      [!!] CoD watcher"
     cod="$(hciconfig "$(detect_hci)" class 2>/dev/null | grep -oE '0x[0-9a-fA-F]{6}' | head -1)"
-    echo "      adapter CoD: ${cod:-unknown} (want 0x240414)"
+    echo "      adapter CoD: ${cod:-unknown} (want ${WANT_COD})"
     bluetoothctl show 2>/dev/null | grep -q '0000110b-0000-1000-8000-00805f9b34fb' \
         && echo "      [OK] advertises Audio Sink 0x110b" \
         || echo "      [!!] not advertising 0x110b"
@@ -324,6 +431,10 @@ _setup_node() {
     elif [[ -d "${HOME}/.local/node/bin" ]]; then
         export PATH="${HOME}/.local/node/bin:${PATH}"
         echo "info: detected node at ~/.local/node/bin"
+    elif [[ -n "${TARGET_HOME:-}" && -d "${TARGET_HOME}/.local/node/bin" ]]; then
+        # N3: under sudo, HOME is /root; the appliance user's node lives here.
+        export PATH="${TARGET_HOME}/.local/node/bin:${PATH}"
+        echo "info: detected node at ${TARGET_HOME}/.local/node/bin"
     fi
     if ! command -v node &>/dev/null; then
         echo "error: node not found on PATH. Set SOUNDSYNC_NODE_BIN or install node." >&2
@@ -342,11 +453,14 @@ _setup_node() {
 #             cmake is required because webrtc-srtp builds a native lib via the
 #             cmake crate; build-essential does NOT include it.
 RUNTIME_PKGS=(
-    pipewire pipewire-pulse pipewire-audio wireplumber
+    pipewire pipewire-pulse pipewire-audio pipewire-bin wireplumber
+    # pipewire-bin provides the pw-* tools (pw-cat/pw-cli/pw-metadata/pw-link/
+    # pw-loopback) the daemon hard-requires; not contractual transitively.
     libspa-0.2-bluetooth pulseaudio-utils
     bluez bluez-tools ffmpeg
     avahi-daemon avahi-utils rfkill
     dbus-bin                              # dbus-monitor, used by the CoD watcher
+    curl                                 # used by --reset / --doctor port check
 )
 BUILD_PKGS=(
     build-essential pkg-config cmake
@@ -367,8 +481,11 @@ _install_system_deps() {
         pkgs+=( "${BUILD_PKGS[@]}" )
     fi
     echo "==> Installing system dependencies (apt)..."
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+    # N1: a transient/offline network must not abort a re-install where deps are
+    # already present. Warn and continue; the install batch reports any failures.
+    apt-get update -qq || echo 'warn: apt update failed (offline?); continuing' >&2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" \
+        || echo 'warn: some deps failed; verify with --doctor' >&2
 }
 
 if [[ $NO_DEPS -eq 0 ]]; then
@@ -376,6 +493,11 @@ if [[ $NO_DEPS -eq 0 ]]; then
 else
     echo "info: --no-deps given; skipping system dependency install."
 fi
+
+# G2: hciconfig (legacy bluez tool) is required for CoD pinning + the watcher;
+# on bluez 5.x it may not be in the default bluez package. Warn, don't fail.
+command -v hciconfig >/dev/null \
+    || echo 'warn: hciconfig not found (CoD pinning will be unavailable on this host)' >&2
 
 # ---------------------------------------------------------------------------
 # Build step
@@ -428,11 +550,24 @@ install -m 0755 "$SRC_BINARY" "$BINARY_DEST"
 # Install webui SPA
 # ---------------------------------------------------------------------------
 echo "==> Installing webui -> ${WEBUI_DEST}"
-mkdir -p "$WEBUI_DEST"
-# Clear stale content first: the SPA uses content-hashed asset filenames, so a
-# plain copy would accumulate old index-*.{js,css} from previous versions.
-find "$WEBUI_DEST" -mindepth 1 -delete
-cp -a "${SRC_WEBUI}/." "$WEBUI_DEST/"
+# G14: deploy atomically. The SPA uses content-hashed asset filenames, so we
+# must replace (not merge) the dir — but a clear-before-copy can leave the live
+# UI empty/partial if interrupted. Build the new tree in a sibling, then swap.
+# Refuse to touch the live dir unless the source actually has built content.
+if [[ ! -f "${SRC_WEBUI}/index.html" ]]; then
+    echo "error: webui source has no index.html: ${SRC_WEBUI}" >&2
+    echo "hint:  run a build first, or use --from <prebuilt-dir>" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$WEBUI_DEST")"
+rm -rf "${WEBUI_DEST}.new" "${WEBUI_DEST}.old"
+mkdir -p "${WEBUI_DEST}.new"
+cp -a "${SRC_WEBUI}/." "${WEBUI_DEST}.new/"
+if [[ -e "$WEBUI_DEST" ]]; then
+    mv "$WEBUI_DEST" "${WEBUI_DEST}.old"
+fi
+mv "${WEBUI_DEST}.new" "$WEBUI_DEST"
+rm -rf "${WEBUI_DEST}.old"
 
 # ---------------------------------------------------------------------------
 # Install systemd units
@@ -495,9 +630,25 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Reloading systemd and enabling units..."
 systemctl daemon-reload
-systemctl enable --now soundsync-adapter.service
-systemctl enable --now soundsync-adapter-cod.service
-systemctl --global enable soundsync.service
+
+# G13: on a RE-INSTALL the new binary/CoD script are on disk but the already-
+# active system units keep running the OLD code (enable --now won't restart an
+# active unit). try-restart picks up the new code now, mirroring the user-unit
+# restart below. (no-op when the unit is inactive)
+systemctl try-restart soundsync-adapter.service || true
+systemctl try-restart soundsync-adapter-cod.service || true
+
+# G3: adapter setup must NOT abort the whole install under `set -e`. The oneshot
+# runs apply-adapter-config, which can fail if hciconfig is missing (G2) or no
+# BT adapter is present. Split enable (persist) from start (this run) so a start
+# failure is a WARNING and the rest of the enable section still runs.
+systemctl enable soundsync-adapter.service || true
+systemctl start soundsync-adapter.service \
+    || echo 'warn: adapter setup failed (no BT adapter or missing hciconfig); will retry at boot' >&2
+systemctl enable soundsync-adapter-cod.service || true
+systemctl start soundsync-adapter-cod.service \
+    || echo 'warn: CoD watcher failed to start (no BT adapter or missing hciconfig); will retry at boot' >&2
+systemctl --global enable soundsync.service || true
 
 # Reload the TARGET USER's manager too, so changes to the *user* unit (e.g.
 # TimeoutStopSec/KillMode) apply to a currently-running instance now rather than
@@ -507,6 +658,12 @@ if [[ -n "$TARGET_USER" && -n "$TARGET_UID" && -d "/run/user/${TARGET_UID}" ]]; 
     if run_user systemctl --user is-active --quiet soundsync.service; then
         run_user systemctl --user restart soundsync.service \
             && echo "    restarted ${TARGET_USER}'s running soundsync.service (unit changes applied)."
+    else
+        # G4: a fresh install must actually START the daemon THIS run, not just
+        # enable it for the next login. enable --now also persists for the user.
+        run_user systemctl --user enable --now soundsync.service \
+            && echo "    started ${TARGET_USER}'s soundsync.service (running now)." \
+            || echo "warn: could not start ${TARGET_USER}'s soundsync.service this run" >&2
     fi
 fi
 

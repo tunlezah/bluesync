@@ -12,8 +12,15 @@ USER_UNIT=/usr/lib/systemd/user/soundsync.service
 SYSTEM_UNIT=/usr/lib/systemd/system/soundsync-adapter.service
 COD_UNIT=/usr/lib/systemd/system/soundsync-adapter-cod.service
 COD_SCRIPT=/usr/lib/soundsync/soundsync-cod-watch.sh
-WP_CONF=/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf
-WP_LUA=/etc/wireplumber/wireplumber.conf.d/51-soundsync.lua.d
+# G6: purge the real superset the binary actually writes (mirror install.sh
+# --reset). WP 0.5 uses .../wireplumber.conf.d/51-soundsync*.conf; WP 0.4.x uses
+# .../bluetooth.lua.d/51-soundsync*. The old .../wireplumber.conf.d/51-soundsync.lua.d
+# path was bogus (a directory the binary never wrote) and is dropped.
+WP_CONF_GLOB='/etc/wireplumber/wireplumber.conf.d/51-soundsync*.conf'
+WP_LUA_GLOB='/etc/wireplumber/bluetooth.lua.d/51-soundsync*'
+# N7: deb-only conffile (shipped by the .deb, not by install.sh); a
+# deb-then-shell teardown would otherwise orphan it.
+DEB_CONFFILE=/etc/default/soundsync
 
 PURGE=0
 
@@ -57,6 +64,52 @@ _rm_if_exists() {
         echo "    (already absent: $path)"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# G15: resolve the appliance user (mirror install.sh / debian/postinst).
+# Prefer SUDO_USER; else auto-detect the SOLE human login account (exactly one
+# passwd entry with uid in [1000,65534) and a real login shell). If zero or
+# several candidates exist we leave it empty and skip the per-user stop — the
+# --global disable below still removes the symlink. Best-effort, never fatal.
+# ---------------------------------------------------------------------------
+TARGET_USER="${SUDO_USER:-}"
+if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
+    TARGET_USER="$(
+        getent passwd 2>/dev/null | awk -F: '
+            $3 >= 1000 && $3 < 65534 &&
+            $7 != "/usr/sbin/nologin" && $7 != "/sbin/nologin" &&
+            $7 != "/bin/false" && $7 != "/usr/bin/false" && $7 != "" \
+            { u=$1; n++ }
+            END { if (n == 1) print u }
+        '
+    )" || true
+fi
+TARGET_UID=""
+if [[ -n "$TARGET_USER" ]]; then
+    TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"
+fi
+
+# ---------------------------------------------------------------------------
+# G15: stop the running per-user soundsync.service BEFORE the binary is removed.
+# --global disable (below) only removes the enable symlink; it does not stop a
+# currently-running per-user instance. Once the binary is gone, that instance
+# would hit Restart=always and flap until the session ends/reboot. Reach into
+# the user's session bus to stop (and disable for good measure). Best-effort.
+# ---------------------------------------------------------------------------
+if [[ -n "$TARGET_USER" && -n "$TARGET_UID" && -d "/run/user/${TARGET_UID}" ]]; then
+    echo "==> Stopping ${TARGET_USER}'s running soundsync.service (G15)..."
+    sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="/run/user/${TARGET_UID}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus" \
+        systemctl --user stop soundsync.service 2>/dev/null || true
+    sudo -u "$TARGET_USER" \
+        XDG_RUNTIME_DIR="/run/user/${TARGET_UID}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus" \
+        systemctl --user disable soundsync.service 2>/dev/null || true
+    echo "    stopped: soundsync.service (user: ${TARGET_USER})"
+else
+    echo "    (no active per-user session to stop soundsync.service in)"
+fi
 
 # ---------------------------------------------------------------------------
 # Stop + disable units (ignore errors — units may already be inactive)
@@ -113,8 +166,15 @@ systemctl daemon-reload
 # ---------------------------------------------------------------------------
 if [[ $PURGE -eq 1 ]]; then
     echo "==> Purging WirePlumber config..."
-    _rm_if_exists "$WP_CONF"
-    _rm_if_exists "$WP_LUA"
+    # G6: remove the real paths the binary writes (both WP formats), mirroring
+    # install.sh --reset. rm -f is idempotent + best-effort when nothing matches.
+    rm -f $WP_CONF_GLOB 2>/dev/null || true
+    echo "    removed (if present): $WP_CONF_GLOB"
+    rm -f $WP_LUA_GLOB 2>/dev/null || true
+    echo "    removed (if present): $WP_LUA_GLOB"
+    # N7: best-effort remove the deb-only conffile (shipped by the .deb, never by
+    # install.sh) so a deb-then-shell teardown does not orphan it.
+    _rm_if_exists "$DEB_CONFFILE"
     echo ""
     echo "NOTE: per-user config in ~/.config/soundsync/ is NOT removed."
     echo "      Remove it manually if desired."

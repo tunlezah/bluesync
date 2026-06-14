@@ -1,10 +1,27 @@
 //! Read-only self-check (`soundsync doctor`). All I/O goes through the
 //! `CommandRunner` / `Fs` seams so the checks are fully unit-testable.
-use crate::capabilities::probe::detect_config_format;
+use crate::adapter_id::resolve_adapter;
+use crate::capabilities::probe::detect_config_format_guarded;
 use crate::sys::command::CommandRunner;
 use crate::sys::fs::Fs;
 use crate::wireplumber::config::generate;
 use std::fmt;
+
+/// Load-bearing keys the on-disk WirePlumber config MUST contain to actually
+/// route A2DP audio. Verified against the regenerated expected config so a file
+/// that exists but had a key dropped/replaced (e.g. `a2dp_sink`→`a2dp_source`),
+/// lost its roles block, or got SPA-JSON-corrupted (which WirePlumber silently
+/// ignores) is reported as a FAIL rather than a Pass (G10).
+///
+/// Each entry is a substring that must appear verbatim in the regenerated
+/// expected contents AND in the on-disk file. We intersect against the generated
+/// config so this list cannot drift away from the writer (`wireplumber::config`).
+const REQUIRED_WP_KEYS: &[&str] = &[
+    "seat-monitoring = disabled",
+    "a2dp_sink",
+    "bluez5.codecs",
+    "enable-hw-volume",
+];
 
 /// Outcome of a single doctor check.
 #[derive(Debug, PartialEq, Eq)]
@@ -117,18 +134,49 @@ pub fn run_checks<R: CommandRunner, F: Fs>(runner: &R, fs: &F, web_dir: &str) ->
         }
     }
 
-    // 3. WP config present + format ────────────────────────────────────────
+    // 3. WP config present + content/role drift ────────────────────────────
+    //
+    // The format is detected with the guarded probe so a momentarily-unreadable
+    // `wireplumber --version` does not make doctor expect the wrong path (G10).
+    // We then regenerate the EXPECTED config (the writer is the oracle) and
+    // assert each load-bearing key present in that expected output is also on
+    // disk. A file that exists but is missing a required key (drift, role swap,
+    // SPA-JSON corruption WP would silently ignore) is a FAIL, not a Pass.
     {
-        let wp_fmt = detect_config_format(runner);
+        let wp_fmt = detect_config_format_guarded(runner, fs);
         let cfg = generate(wp_fmt);
         let path = format!("{}/{}", cfg.etc_dir, cfg.filename);
+        // Only require keys that the writer actually emits for THIS format
+        // (e.g. `seat-monitoring` is SPA-JSON-only) — keeps this in lockstep
+        // with `wireplumber::config` instead of hardcoding a format's keys.
+        let expected_keys: Vec<&str> = REQUIRED_WP_KEYS
+            .iter()
+            .copied()
+            .filter(|k| cfg.contents.contains(k))
+            .collect();
         match fs.read_to_string(&path) {
-            Ok(_) => {
-                checks.push(Check {
-                    name: "wp-config".to_string(),
-                    status: CheckStatus::Pass,
-                    detail: format!("WirePlumber A2DP config present at {path}"),
-                });
+            Ok(on_disk) => {
+                let missing: Vec<&str> = expected_keys
+                    .iter()
+                    .copied()
+                    .filter(|k| !on_disk.contains(k))
+                    .collect();
+                if missing.is_empty() {
+                    checks.push(Check {
+                        name: "wp-config".to_string(),
+                        status: CheckStatus::Pass,
+                        detail: format!("WirePlumber A2DP config present and valid at {path}"),
+                    });
+                } else {
+                    checks.push(Check {
+                        name: "wp-config".to_string(),
+                        status: CheckStatus::Fail,
+                        detail: format!(
+                            "WirePlumber A2DP config at {path} is present but drifted (missing: {}); run: sudo soundsync apply-wireplumber-config",
+                            missing.join(", ")
+                        ),
+                    });
+                }
             }
             Err(_) => {
                 checks.push(Check {
@@ -143,20 +191,23 @@ pub fn run_checks<R: CommandRunner, F: Fs>(runner: &R, fs: &F, web_dir: &str) ->
     }
 
     // 4. Bluetooth adapter present ─────────────────────────────────────────
+    // Resolve the adapter the same way the daemon does (SOUNDSYNC_HCI →
+    // first hci* → hci0); never hardcode hci0 (G7).
     {
-        match runner.run("hciconfig", &["hci0"]) {
+        let hci = resolve_adapter();
+        match runner.run("hciconfig", &[hci.as_str()]) {
             Ok(out) if out.success() => {
                 checks.push(Check {
                     name: "bt-adapter".to_string(),
                     status: CheckStatus::Pass,
-                    detail: "hci0 adapter present".to_string(),
+                    detail: format!("{hci} adapter present"),
                 });
             }
             _ => {
                 checks.push(Check {
                     name: "bt-adapter".to_string(),
                     status: CheckStatus::Warn,
-                    detail: "no hci0 adapter".to_string(),
+                    detail: format!("no {hci} adapter"),
                 });
             }
         }
@@ -233,12 +284,14 @@ mod tests {
             )
     }
 
-    /// Build an Fs with the WP SPA-JSON config path and a web-dir index.html.
+    /// Build an Fs with a *valid* WP SPA-JSON config (the real generated
+    /// contents, so the content-drift check passes) and a web-dir index.html.
     fn all_ok_fs() -> FakeFs {
+        let spa = generate(crate::capabilities::version::ConfigFormat::SpaJson);
         FakeFs::new()
             .with_file(
                 "/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf",
-                "# config",
+                &spa.contents,
             )
             .with_file("/usr/share/soundsync/webui/index.html", "<!DOCTYPE html>")
     }
@@ -328,6 +381,58 @@ mod tests {
     }
 
     #[test]
+    fn drifted_wp_config_present_but_missing_key_gives_fail() {
+        // File EXISTS at the SPA path but is missing a load-bearing key
+        // (here `a2dp_sink` — e.g. swapped to a2dp_source, or roles dropped).
+        // Old doctor passed on mere presence; the strengthened check must FAIL.
+        let runner = all_ok_runner();
+        let drifted = r#"wireplumber.profiles = {
+    main = {
+        monitor.bluez.seat-monitoring = disabled
+    }
+}
+monitor.bluez.properties = {
+    bluez5.roles = [ a2dp_source ]
+    bluez5.codecs = [ sbc aac ]
+    bluez5.enable-hw-volume = true
+}
+"#;
+        let fs = FakeFs::new()
+            .with_file(
+                "/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf",
+                drifted,
+            )
+            .with_file("/usr/share/soundsync/webui/index.html", "<!DOCTYPE html>");
+        let report = run_checks(&runner, &fs, "/usr/share/soundsync/webui");
+
+        let wp = report
+            .checks
+            .iter()
+            .find(|c| c.name == "wp-config")
+            .expect("wp-config check must exist");
+        assert_eq!(wp.status, CheckStatus::Fail, "drifted config must Fail");
+        assert!(wp.detail.contains("drifted"), "detail: {}", wp.detail);
+        assert!(wp.detail.contains("a2dp_sink"), "detail: {}", wp.detail);
+        assert!(!report.ok());
+    }
+
+    #[test]
+    fn valid_wp_config_gives_pass() {
+        // The exact generated SPA-JSON config must pass the content check.
+        let runner = all_ok_runner();
+        let fs = all_ok_fs();
+        let report = run_checks(&runner, &fs, "/usr/share/soundsync/webui");
+
+        let wp = report
+            .checks
+            .iter()
+            .find(|c| c.name == "wp-config")
+            .expect("wp-config check must exist");
+        assert_eq!(wp.status, CheckStatus::Pass, "detail: {}", wp.detail);
+        assert!(wp.detail.contains("valid"));
+    }
+
+    #[test]
     fn missing_bt_adapter_gives_warn_not_fail() {
         let runner = FakeCommandRunner::new()
             .with(
@@ -375,10 +480,11 @@ mod tests {
     #[test]
     fn missing_web_dir_gives_warn_not_fail() {
         let runner = all_ok_runner();
-        // fs has WP config but NO webui index.html
+        // fs has a valid WP config but NO webui index.html
+        let spa = generate(crate::capabilities::version::ConfigFormat::SpaJson);
         let fs = FakeFs::new().with_file(
             "/etc/wireplumber/wireplumber.conf.d/51-soundsync.conf",
-            "# config",
+            &spa.contents,
         );
         let report = run_checks(&runner, &fs, "/usr/share/soundsync/webui");
 
