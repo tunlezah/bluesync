@@ -24,8 +24,83 @@ case "$1" in
             systemctl enable --now soundsync-adapter.service || true
         fi
 
+        # Enable the Class-of-Device watcher unit (keeps the adapter CoD pinned
+        # to an audio speaker; see soundsync-cod-watch.sh / AUD-002).
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper enable soundsync-adapter-cod.service || true
+        fi
+        # If we are running inside a live system (not a chroot), start it now.
+        if systemctl is-system-running --quiet 2>/dev/null; then
+            systemctl enable --now soundsync-adapter-cod.service || true
+        fi
+
         # Enable the user daemon unit for all future user sessions (global enable).
         systemctl --global enable soundsync.service || true
+
+        # -------------------------------------------------------------------
+        # Headless autostart (NF-10) + load the just-written A2DP config (NF-31)
+        # -------------------------------------------------------------------
+        # The daemon is a systemd *user* service inside one account's PipeWire
+        # session. Resolve that appliance user, then (a) enable linger so the
+        # session/daemon start at boot without a login, and (b) restart that
+        # user's WirePlumber so it picks up the A2DP config written above.
+        #
+        # Resolve SS_USER:
+        #   1. an explicit USER= in /etc/default/soundsync, else
+        #   2. auto-detect the SOLE human login account (exactly one passwd
+        #      entry with uid in [1000,65534) and a real login shell).
+        # If zero or several candidates exist, SS_USER stays empty and we print
+        # a remediation note instead of guessing.
+        SS_USER=""
+        if [ -r /etc/default/soundsync ]; then
+            # shellcheck disable=SC1091
+            SS_USER="$( . /etc/default/soundsync 2>/dev/null; printf '%s' "${USER:-}" )" || true
+        fi
+        if [ -z "$SS_USER" ]; then
+            SS_USER="$(
+                getent passwd 2>/dev/null | awk -F: '
+                    $3 >= 1000 && $3 < 65534 &&
+                    $7 != "/usr/sbin/nologin" && $7 != "/sbin/nologin" &&
+                    $7 != "/bin/false" && $7 != "/usr/bin/false" && $7 != "" \
+                    { u=$1; n++ }
+                    END { if (n == 1) print u }
+                '
+            )" || true
+        fi
+
+        if [ -n "$SS_USER" ] && id "$SS_USER" >/dev/null 2>&1; then
+            # NF-10: enable linger so the headless daemon starts at boot.
+            if command -v loginctl >/dev/null 2>&1; then
+                loginctl enable-linger "$SS_USER" || true
+            fi
+            echo "soundsync: enabled linger for '$SS_USER' (headless autostart)." || true
+
+            # NF-31: restart that user's WirePlumber so the A2DP config loads,
+            # but ONLY if their session bus is live. Root cannot restart a user
+            # service directly, so act as the user via runuser with the session
+            # env. If no live session, linger will start it at boot/next login.
+            SS_UID="$(id -u "$SS_USER" 2>/dev/null)" || true
+            if [ -n "$SS_UID" ] && [ -d "/run/user/$SS_UID" ]; then
+                runuser -u "$SS_USER" -- env \
+                    XDG_RUNTIME_DIR="/run/user/$SS_UID" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SS_UID/bus" \
+                    systemctl --user daemon-reload || true
+                runuser -u "$SS_USER" -- env \
+                    XDG_RUNTIME_DIR="/run/user/$SS_UID" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SS_UID/bus" \
+                    systemctl --user restart wireplumber || true
+                echo "soundsync: restarted '$SS_USER' WirePlumber (A2DP config loaded)." || true
+            else
+                echo "soundsync: '$SS_USER' has no live session; WirePlumber will" \
+                     "load the A2DP config at next boot/login (linger is enabled)." || true
+            fi
+        else
+            echo "soundsync: could not determine the appliance user automatically." >&2 || true
+            echo "  Set USER=<name> in /etc/default/soundsync then run" \
+                 "'sudo dpkg-reconfigure soundsync'," >&2 || true
+            echo "  or run 'sudo loginctl enable-linger <user>' so the headless" \
+                 "daemon starts at boot." >&2 || true
+        fi
 
         echo "soundsync: installation complete."
         echo "  - The adapter-setup unit runs at boot (system service)."

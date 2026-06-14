@@ -6,12 +6,13 @@
 //! the answer travel the event bus as `SystemEvent::Webrtc*`.
 use crate::audio::opus_encoder::OpusEncoder;
 use crate::state::{AppStateHandle, SystemEvent};
+use crate::web::webrtc::command::WebRtcCommand;
 use crate::web::webrtc::control::WebRtcController;
 use crate::web::webrtc::pump::{run_opus_pump, RtpSink};
 use crate::web::ws::IceCandidate;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use uuid::Uuid;
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -21,6 +22,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -89,14 +91,24 @@ pub struct WebrtcController {
     pcm_bus: broadcast::Sender<Vec<f32>>,
     /// To publish `SystemEvent::Webrtc*` (answer + ICE) back to the owning WS.
     state: AppStateHandle,
+    /// A clone of the command channel so the `on_peer_connection_state_change`
+    /// callback (which is `'static` and cannot borrow `&self`) can route a
+    /// `Stop` for a failed PC back through the single command loop — the same
+    /// idempotent teardown the WS `Stop` uses (NF-7).
+    webrtc_tx: mpsc::Sender<WebRtcCommand>,
     sessions: Mutex<HashMap<Uuid, SessionHandle>>,
 }
 
 impl WebrtcController {
-    pub fn new(pcm_bus: broadcast::Sender<Vec<f32>>, state: AppStateHandle) -> Self {
+    pub fn new(
+        pcm_bus: broadcast::Sender<Vec<f32>>,
+        state: AppStateHandle,
+        webrtc_tx: mpsc::Sender<WebRtcCommand>,
+    ) -> Self {
         Self {
             pcm_bus,
             state,
+            webrtc_tx,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -166,6 +178,24 @@ impl WebRtcController for WebrtcController {
                             sdp_mline_index: init.sdp_mline_index,
                         });
                     }
+                }
+            })
+        }));
+
+        // Half-open client reaping (NF-7): if the PC transitions to `Failed`
+        // (abandoned client → ICE consent-freshness expiry, sleep, NAT rebind),
+        // route a `Stop` through the command loop to tear down the PC + Opus
+        // pump. Match `Failed` ONLY: `Closed` is our own `pc.close()` echo (would
+        // self-trigger an extra Stop on every teardown) and `Disconnected` is a
+        // transient ICE blip the browser usually recovers. The Stop path is
+        // idempotent (remove-before-close), so the redundant Stop a real WS
+        // disconnect also sends is a harmless no-op.
+        let fail_tx = self.webrtc_tx.clone();
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let fail_tx = fail_tx.clone();
+            Box::pin(async move {
+                if matches!(state, RTCPeerConnectionState::Failed) {
+                    let _ = fail_tx.send(WebRtcCommand::Stop { session }).await;
                 }
             })
         }));

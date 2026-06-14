@@ -1,3 +1,19 @@
+soundsync (0.0.2) unstable; urgency=medium
+
+  * Ship + enable the Class-of-Device watcher unit in the .deb so the adapter
+    stays advertised as an audio speaker, matching install.sh (NF-9).
+  * postinst now enables systemd linger for the appliance user so the headless
+    user daemon starts at boot without an interactive login (NF-10). The user
+    is taken from USER= in /etc/default/soundsync, else auto-detected as the
+    sole human login account; otherwise a remediation note is printed.
+  * postinst restarts the appliance user's WirePlumber after writing the A2DP
+    config, but only when that user's session bus is live (NF-31). Without a
+    live session the config loads at the next boot/login.
+  * Ship a commented /etc/default/soundsync (conffile) to select the appliance
+    user for linger + WirePlumber restart.
+
+ -- SoundSync Maintainers <soundsync@example.com>  Sat, 14 Jun 2026 00:00:00 +0000
+
 soundsync (0.0.1) unstable; urgency=medium
 
   * Initial packaging: Bluetooth A2DP sink daemon with DSP EQ + web UI.

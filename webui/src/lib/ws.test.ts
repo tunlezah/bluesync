@@ -62,6 +62,14 @@ describe('WS message type discrimination', () => {
     }
   });
 
+  it('device_name has .name string', () => {
+    const msg: WsServerMessage = { type: 'device_name', name: 'Living Room' };
+    expect(msg.type).toBe('device_name');
+    if (msg.type === 'device_name') {
+      expect(msg.name).toBe('Living Room');
+    }
+  });
+
   it('webrtc_answer has .data.sdp', () => {
     const msg: WsServerMessage = { type: 'webrtc_answer', data: { sdp: 'v=0\r\n...' } };
     if (msg.type === 'webrtc_answer') {
@@ -90,6 +98,8 @@ interface MockState {
   media: unknown;
   eq: unknown;
   spectrum: number[];
+  deviceName: string;
+  output: import('./types').OutputState | null;
 }
 
 function applyMessage(state: MockState, msg: WsServerMessage): MockState {
@@ -101,6 +111,8 @@ function applyMessage(state: MockState, msg: WsServerMessage): MockState {
         devices: msg.data.bluetooth_devices,
         media: msg.data.media,
         eq: msg.data.eq ?? state.eq,
+        deviceName: msg.data.device_name ?? state.deviceName,
+        output: msg.data.output ?? state.output,
       };
     case 'bluetooth_devices':
       return { ...state, devices: msg.devices };
@@ -110,13 +122,17 @@ function applyMessage(state: MockState, msg: WsServerMessage): MockState {
       return { ...state, eq: msg.eq };
     case 'spectrum_data':
       return { ...state, spectrum: msg.bands };
+    case 'device_name':
+      return { ...state, deviceName: msg.name };
+    case 'output_state':
+      return { ...state, output: msg.output };
     default:
       return state;
   }
 }
 
 describe('store state transitions', () => {
-  const initial: MockState = { snapshot: null, devices: [], media: null, eq: null, spectrum: [] };
+  const initial: MockState = { snapshot: null, devices: [], media: null, eq: null, spectrum: [], deviceName: 'SoundSync', output: null };
 
   it('state_snapshot seeds all slices', () => {
     const msg: WsServerMessage = {
@@ -162,5 +178,66 @@ describe('store state transitions', () => {
     const next = applyMessage(initial, msg);
     expect(next.spectrum).toHaveLength(64);
     expect(next.spectrum[0]).toBe(0.5);
+  });
+
+  it('device_name updates deviceName slice', () => {
+    const msg: WsServerMessage = { type: 'device_name', name: 'Kitchen Speaker' };
+    const next = applyMessage(initial, msg);
+    expect(next.deviceName).toBe('Kitchen Speaker');
+  });
+
+  it('output_state with cast_health=lost clears the active device (NF-8)', () => {
+    // First a connecting cast becomes active.
+    const connecting: WsServerMessage = {
+      type: 'output_state',
+      output: {
+        active: { kind: 'chromecast', id: 'cc1', name: 'Living Room' },
+        available: { soundcard: [], airplay: [], chromecast: [] },
+        cast_health: 'connecting',
+      },
+    };
+    let next = applyMessage(initial, connecting);
+    expect(next.output?.active?.id).toBe('cc1');
+    expect(next.output?.cast_health).toBe('connecting');
+
+    // Then the session dies: backend clears active and reports lost.
+    const lost: WsServerMessage = {
+      type: 'output_state',
+      output: {
+        active: null,
+        available: { soundcard: [], airplay: [], chromecast: [] },
+        cast_health: 'lost',
+      },
+    };
+    next = applyMessage(next, lost);
+    expect(next.output?.active).toBeNull();
+    expect(next.output?.cast_health).toBe('lost');
+  });
+
+  it('output_state without cast_health is accepted (backward compatible)', () => {
+    const msg: WsServerMessage = {
+      type: 'output_state',
+      output: {
+        active: null,
+        available: { soundcard: [], airplay: [], chromecast: [] },
+      },
+    };
+    const next = applyMessage(initial, msg);
+    expect(next.output?.active).toBeNull();
+    expect(next.output?.cast_health ?? null).toBeNull();
+  });
+
+  it('state_snapshot seeds deviceName when present', () => {
+    const msg: WsServerMessage = {
+      type: 'state_snapshot',
+      data: {
+        version: '0.1.0',
+        bluetooth_devices: [],
+        media: null,
+        device_name: 'Bedroom',
+      },
+    };
+    const next = applyMessage(initial, msg);
+    expect(next.deviceName).toBe('Bedroom');
   });
 });

@@ -1,0 +1,8 @@
+# debhelper / dpkg-buildpackage build artifacts
+/.debhelper/
+/files
+/debhelper-build-stamp
+/soundsync/
+*.substvars
+*.debhelper
+*.debhelper.log

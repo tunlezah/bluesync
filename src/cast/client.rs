@@ -177,19 +177,75 @@ impl Drop for CastHandle {
     }
 }
 
+/// A running CASTV2 session: the [`CastHandle`] (shutdown signal) plus the
+/// spawned session task's [`JoinHandle`].
+///
+/// The controller uses [`CastSession::is_finished`] to detect that the session
+/// task has exited — whether from EOF, a read/write error, or the NF-26
+/// inbound deadline — and then clears the active output + surfaces health
+/// (NF-8).  Holding the `JoinHandle` also means the task is no longer "fire and
+/// forget": it is owned, observable, and dropped explicitly on teardown.
+pub struct CastSession {
+    pub handle: CastHandle,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+impl CastSession {
+    /// `true` once the session task has exited (EOF / error / inbound deadline).
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    /// Signal the session task to shut down gracefully.
+    ///
+    /// Non-blocking: this only sends the watch signal (via the `CastHandle`).
+    /// The `JoinHandle` is not awaited — it is dropped with `self`, matching the
+    /// controller's non-blocking teardown style.
+    pub fn stop(&self) {
+        self.handle.stop();
+    }
+}
+
 /// Spawn a CASTV2 session that connects to `ip:port` and casts `media_url`.
 ///
 /// The session is best-effort: any connection or protocol error is logged and
-/// the task exits quietly.  The caller can detect this via the returned
-/// [`CastHandle`] going stale (the watch channel will close when the task
-/// exits) but for the current use-case the controller simply stops the
-/// session on teardown.
-pub fn start_cast(ip: String, port: u16, media_url: String) -> CastHandle {
+/// the task exits quietly.  The returned [`CastSession`] carries the task's
+/// [`JoinHandle`] so the controller can poll [`CastSession::is_finished`] to
+/// detect the task dying (EOF / read-error / write-failure / inbound deadline)
+/// and react — clearing the active output and surfacing health (NF-8).
+pub fn start_cast(ip: String, port: u16, media_url: String) -> CastSession {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(run_cast_session(ip, port, media_url, shutdown_rx));
-    CastHandle {
-        shutdown: shutdown_tx,
+    let task = tokio::spawn(run_cast_session(ip, port, media_url, shutdown_rx));
+    CastSession {
+        handle: CastHandle {
+            shutdown: shutdown_tx,
+        },
+        task,
     }
+}
+
+/// NF-26: maximum time the inbound link may be silent before the session
+/// declares the link lost and returns.
+///
+/// Set to 3× the 5 s heartbeat ("three strikes" — AUD-065).  A live Chromecast
+/// emits a heartbeat PING plus periodic MEDIA_STATUS/RECEIVER_STATUS frames, so
+/// inbound activity stays well within this window; a half-open TCP connection
+/// (device unplugged / network blackholed) goes silent and is reaped here in
+/// ~15 s instead of silencing for minutes.  This is the single tuning knob.
+const CAST_INBOUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Pure predicate for the NF-26 inbound deadline: `true` when the link should be
+/// declared lost because no inbound frame has arrived within `deadline`.
+///
+/// Extracted so the arithmetic is unit-testable without driving real TLS I/O
+/// (the live read/heartbeat loop is verified end-to-end; this covers the edge
+/// arithmetic).
+fn link_lost(
+    last_inbound: tokio::time::Instant,
+    now: tokio::time::Instant,
+    deadline: std::time::Duration,
+) -> bool {
+    now.duration_since(last_inbound) > deadline
 }
 
 /// The CASTV2 session task.
@@ -203,6 +259,13 @@ pub fn start_cast(ip: String, port: u16, media_url: String) -> CastHandle {
 ///    - other → ignore.
 /// 4. Heartbeat PING sent every ~5 s.
 /// 5. On shutdown signal → send CLOSE(receiver-0) best-effort, then return.
+///
+/// NF-26: every inbound frame refreshes `last_inbound`; if the heartbeat tick
+/// finds no inbound activity within [`CAST_INBOUND_DEADLINE`], the link is
+/// declared lost and the task returns.  This prompt return is what NF-8's
+/// controller tick observes (via [`CastSession::is_finished`]) to clear the
+/// stale active output — without it a half-open TCP connection silences for
+/// minutes.
 async fn run_cast_session(
     ip: String,
     port: u16,
@@ -271,6 +334,10 @@ async fn run_cast_session(
     // Skip the immediate first tick so we don't send a PING before the handshake settles.
     heartbeat.tick().await;
 
+    // NF-26: track the last time we received ANY inbound frame.  The connect +
+    // handshake above counts as fresh activity, so seed it now.
+    let mut last_inbound = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             biased;
@@ -298,6 +365,8 @@ async fn run_cast_session(
                         return;
                     }
                     Ok(n) => {
+                        // NF-26: any inbound bytes prove the link is alive.
+                        last_inbound = tokio::time::Instant::now();
                         read_buf.extend_from_slice(&tmp[..n]);
 
                         // Drain all complete frames from read_buf.
@@ -358,6 +427,17 @@ async fn run_cast_session(
                 let ping = string_message(NS_HEARTBEAT, "receiver-0", &messages::ping());
                 if let Err(e) = write_half.write_all(&encode_frame(&ping)).await {
                     eprintln!("soundsync/cast: send PING failed: {e}");
+                    return;
+                }
+                // NF-26: half-open detection.  If no inbound frame has arrived
+                // within the deadline, the TCP link is half-open (the device is
+                // gone but the socket never errored) — declare it lost and
+                // return so NF-8's controller tick clears the active output.
+                if link_lost(last_inbound, tokio::time::Instant::now(), CAST_INBOUND_DEADLINE) {
+                    eprintln!(
+                        "soundsync/cast: no inbound activity for {}s — declaring link lost",
+                        CAST_INBOUND_DEADLINE.as_secs()
+                    );
                     return;
                 }
             }
@@ -482,5 +562,85 @@ mod tests {
             stream_url("192.168.0.5", 80),
             "http://192.168.0.5:80/api/stream/audio.aac"
         );
+    }
+
+    // ── NF-26: inbound deadline predicate ───────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn link_lost_false_when_inbound_recent() {
+        let start = tokio::time::Instant::now();
+        // Elapsed well under the deadline → link is alive.
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let now = tokio::time::Instant::now();
+        assert!(!link_lost(start, now, CAST_INBOUND_DEADLINE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn link_lost_false_exactly_at_deadline() {
+        let start = tokio::time::Instant::now();
+        // Exactly at the deadline must NOT be lost (strict `>`).
+        tokio::time::advance(CAST_INBOUND_DEADLINE).await;
+        let now = tokio::time::Instant::now();
+        assert!(!link_lost(start, now, CAST_INBOUND_DEADLINE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn link_lost_true_when_past_deadline() {
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(CAST_INBOUND_DEADLINE + std::time::Duration::from_secs(1)).await;
+        let now = tokio::time::Instant::now();
+        assert!(link_lost(start, now, CAST_INBOUND_DEADLINE));
+    }
+
+    // ── NF-8: CastSession finished detection ────────────────────────────────
+
+    #[tokio::test]
+    async fn cast_session_is_finished_after_task_completes() {
+        // Deterministically construct a CastSession whose task is already done,
+        // rather than racing a real connect against virtual time.
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async {});
+        let session = CastSession {
+            handle: CastHandle {
+                shutdown: shutdown_tx,
+            },
+            task,
+        };
+        // Yield until the trivial task has actually completed.
+        for _ in 0..100 {
+            if session.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            session.is_finished(),
+            "session.task should report finished once the spawned future completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_session_not_finished_while_task_runs() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        // A task that blocks until told to stop via the shutdown watch.
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        let session = CastSession {
+            handle: CastHandle {
+                shutdown: shutdown_tx,
+            },
+            task,
+        };
+        assert!(!session.is_finished(), "task should still be running");
+        // stop() signals the watch; the task then completes.
+        session.stop();
+        for _ in 0..100 {
+            if session.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(session.is_finished(), "task should finish after stop()");
     }
 }

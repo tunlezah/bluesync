@@ -49,6 +49,23 @@ pub struct EqInfo {
     pub bands: Vec<EqBandInfo>,
 }
 
+/// Health of an active Chromecast session, surfaced to the UI (NF-8).
+///
+/// Two-state by design:
+/// - `Connecting` — a cast session has been started and its task is alive.
+/// - `Lost` — the session task died (EOF / read-error / write-failure / the
+///   NF-26 inbound deadline); the controller has cleared the active output.
+///
+/// There is deliberately NO `Live` variant: confirming "playing" would require
+/// a liveness channel from the session task back to the controller, which is
+/// out of scope.  `Connecting` covers the alive-but-unconfirmed state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CastHealth {
+    Connecting,
+    Lost,
+}
+
 /// Output subsystem state as shown to the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct OutputState {
@@ -56,6 +73,11 @@ pub struct OutputState {
     pub active: Option<OutputDevice>,
     /// All currently discovered output devices.
     pub available: AvailableOutputs,
+    /// Health of the active Chromecast session, if any (NF-8).  `None` when no
+    /// cast is in play.  Additive + optional so the wire format and all
+    /// by-field construction sites stay backward-compatible.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cast_health: Option<CastHealth>,
 }
 
 /// Map a `FilterType` to the wire string.
@@ -449,6 +471,34 @@ mod tests {
         assert!(json.contains("\"chromecast\":[]"));
     }
 
+    #[test]
+    fn output_state_omits_cast_health_when_none() {
+        // skip_serializing_if keeps the wire format backward-compatible: the
+        // field is absent entirely when there is no active cast.
+        let s = OutputState::default();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("cast_health"));
+    }
+
+    #[test]
+    fn output_state_serializes_cast_health_snake_case() {
+        let s = OutputState {
+            active: None,
+            available: AvailableOutputs::default(),
+            cast_health: Some(CastHealth::Connecting),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"cast_health\":\"connecting\""));
+
+        let s = OutputState {
+            active: None,
+            available: AvailableOutputs::default(),
+            cast_health: Some(CastHealth::Lost),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"cast_health\":\"lost\""));
+    }
+
     #[tokio::test]
     async fn set_output_updates_snapshot_and_publishes() {
         use crate::output::{AvailableOutputs, OutputDevice, OutputKind};
@@ -465,6 +515,7 @@ mod tests {
         let output = OutputState {
             active: Some(device),
             available: AvailableOutputs::default(),
+            cast_health: None,
         };
         h.set_output(output.clone()).await;
         assert_eq!(h.snapshot().await.output, output);

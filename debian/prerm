@@ -17,6 +17,17 @@ case "$1" in
         if command -v deb-systemd-helper >/dev/null 2>&1; then
             deb-systemd-helper disable soundsync-adapter.service || true
         fi
+
+        # Stop + disable the Class-of-Device watcher unit (best-effort).
+        if systemctl is-enabled soundsync-adapter-cod.service >/dev/null 2>&1; then
+            systemctl disable --now soundsync-adapter-cod.service || true
+        else
+            systemctl stop soundsync-adapter-cod.service 2>/dev/null || true
+        fi
+
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper disable soundsync-adapter-cod.service || true
+        fi
         ;;
 
     *)

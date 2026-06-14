@@ -1,0 +1,18 @@
+# /etc/default/soundsync — SoundSync appliance configuration
+#
+# SoundSync's daemon runs as a systemd *user* service inside one user's
+# PipeWire session. For a headless appliance, that user needs "linger"
+# enabled so the daemon starts at boot without anyone logging in, and the
+# package must know whose WirePlumber to restart after writing the A2DP
+# config at install time.
+#
+# By default the postinst auto-detects the sole human login account
+# (a single passwd entry with uid >= 1000 and a real login shell). If your
+# box has zero or several such accounts, the auto-detect is skipped and you
+# must name the appliance user here.
+#
+# Uncomment and set USER to the appliance user, e.g.:
+#USER=mark
+#
+# After editing, run:   sudo dpkg-reconfigure soundsync
+#   (or)                sudo loginctl enable-linger <user>

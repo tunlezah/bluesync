@@ -2,7 +2,7 @@ import { useState, useCallback } from 'preact/hooks';
 import { useStore } from '../lib/store';
 import { setOutput, setOutputNone, isUnavailable } from '../lib/api';
 import { useToast } from './Toast';
-import type { OutputDevice, OutputKind } from '../lib/types';
+import type { CastHealth, OutputDevice, OutputKind } from '../lib/types';
 import './OutputPicker.css';
 
 // ── Icons ─────────────────────────────────────────────────────────────────
@@ -81,9 +81,10 @@ const TABS: { key: TabKey; label: string }[] = [
 interface ActiveBadgeProps {
   device: OutputDevice | null;
   switching: boolean;
+  castHealth: CastHealth | null;
 }
 
-function ActiveBadge({ device, switching }: ActiveBadgeProps) {
+function ActiveBadge({ device, switching, castHealth }: ActiveBadgeProps) {
   if (switching) {
     return (
       <div class="output-active output-active--switching" aria-live="polite">
@@ -93,6 +94,20 @@ function ActiveBadge({ device, switching }: ActiveBadgeProps) {
     );
   }
   if (!device) {
+    // NF-8: when a cast session was lost the backend clears the active device;
+    // surface a hint so the user knows the cast dropped (re-select to retry).
+    if (castHealth === 'lost') {
+      return (
+        <div class="output-active output-active--none" aria-live="polite">
+          <span class="output-active__icon">
+            <CastIcon />
+          </span>
+          <span class="output-active__label">
+            Chromecast disconnected — select a device to reconnect
+          </span>
+        </div>
+      );
+    }
     return (
       <div class="output-active output-active--none">
         <span class="output-active__icon">
@@ -102,13 +117,16 @@ function ActiveBadge({ device, switching }: ActiveBadgeProps) {
       </div>
     );
   }
+  // A Chromecast that is connecting (alive but unconfirmed) shows a spinner.
+  const connecting = device.kind === 'chromecast' && castHealth === 'connecting';
   return (
     <div class="output-active output-active--device">
       <span class="output-active__icon">
-        <TabGlyph tab={device.kind} />
+        {connecting ? <span class="spinner" aria-hidden="true" /> : <TabGlyph tab={device.kind} />}
       </span>
       <span class="output-active__label">
-        Playing to: <strong>{device.name}</strong>
+        {connecting ? 'Connecting to: ' : 'Playing to: '}
+        <strong>{device.name}</strong>
       </span>
       <span class="output-active__kind">{KIND_LABEL[device.kind]}</span>
     </div>
@@ -217,6 +235,7 @@ export function OutputPicker() {
   const { output } = store;
   const active = output?.active ?? null;
   const available = output?.available ?? { soundcard: [], airplay: [], chromecast: [] };
+  const castHealth = output?.cast_health ?? null;
 
   // Which category's list is shown — defaults to where audio is currently going.
   const [tab, setTab] = useState<TabKey>(active?.kind ?? 'browser');
@@ -269,7 +288,7 @@ export function OutputPicker() {
         <span class="output-picker__hint">Browser Listen always available alongside</span>
       </div>
 
-      <ActiveBadge device={active} switching={switching} />
+      <ActiveBadge device={active} switching={switching} castHealth={castHealth} />
 
       {/* Segmented type filter — show one category at a time, never all at once */}
       <div class="output-segmented" role="tablist" aria-label="Output type">

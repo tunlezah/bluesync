@@ -58,9 +58,18 @@ export interface AvailableOutputs {
   chromecast: OutputDevice[];
 }
 
+/**
+ * Health of the active Chromecast session (NF-8). `'connecting'` while the
+ * session task is alive (unconfirmed), `'lost'` once it died and the active
+ * output was cleared. Absent/null when no cast is in play. Optional to keep the
+ * wire contract additive (the field is omitted server-side when None).
+ */
+export type CastHealth = 'connecting' | 'lost';
+
 export interface OutputState {
   active: OutputDevice | null;
   available: AvailableOutputs;
+  cast_health?: CastHealth | null;
 }
 
 export interface AppStateSnapshot {
@@ -69,6 +78,8 @@ export interface AppStateSnapshot {
   media: MediaInfo | null;
   eq?: EqInfo;
   output?: OutputState;
+  /** Advertised Bluetooth device name; optional to tolerate older snapshot fixtures. */
+  device_name?: string;
 }
 
 // IceCandidate — exact camelCase keys required (load-bearing for Safari)
@@ -85,6 +96,7 @@ export type WsServerMessage =
   | { type: 'bluetooth_devices'; devices: DeviceInfo[] }
   | { type: 'media_state'; media: MediaInfo | null }
   | { type: 'eq_state'; eq: EqInfo }
+  | { type: 'device_name'; name: string }
   | { type: 'output_state'; output: OutputState }
   | { type: 'webrtc_answer'; data: { sdp: string } }
   | { type: 'webrtc_ice_candidate'; data: IceCandidate };

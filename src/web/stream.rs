@@ -42,27 +42,51 @@ pub fn build_stream_command(format: StreamFormat, device: &str) -> String {
     )
 }
 
+use crate::web::server::WebContext;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The capture monitor parec reads (the null sink's monitor; AUD-034).
 const CAPTURE_MONITOR: &str = "soundsync-capture.monitor";
 
+/// Max concurrent `/api/stream` parec|ffmpeg pipelines (NF-37). Web Listen uses
+/// WebRTC, not this path; real /api/stream consumers are HTTP-fallback browsers
+/// plus one Chromecast pull, so 4 is comfortably above realistic use yet well
+/// below FD exhaustion. Tunable here.
+pub const STREAM_MAX_CONCURRENT: usize = 4;
+
+/// Try to take a stream permit, mapping exhaustion to a 503 response (NF-37).
+/// Factored out so the cap decision is unit-testable without spawning a child.
+fn acquire_stream_permit(limit: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Response> {
+    Arc::clone(limit)
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
+}
+
 /// axum handler: `GET /api/stream/audio.aac`.
-pub async fn stream_aac() -> Response {
-    stream_response(StreamFormat::Aac).await
+pub async fn stream_aac(State(ctx): State<WebContext>) -> Response {
+    stream_response(StreamFormat::Aac, &ctx.stream_limit).await
 }
 
 /// axum handler: `GET /api/stream/audio.mp3`.
-pub async fn stream_mp3() -> Response {
-    stream_response(StreamFormat::Mp3).await
+pub async fn stream_mp3(State(ctx): State<WebContext>) -> Response {
+    stream_response(StreamFormat::Mp3, &ctx.stream_limit).await
 }
 
-async fn stream_response(format: StreamFormat) -> Response {
+async fn stream_response(format: StreamFormat, limit: &Arc<Semaphore>) -> Response {
+    // Bound concurrency BEFORE spawning the pipeline (NF-37). The permit is held
+    // for the body lifetime via the unfold state and released on drop.
+    let permit = match acquire_stream_permit(limit) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let cmd = build_stream_command(format, CAPTURE_MONITOR);
     let mut child = match Command::new("sh")
         .args(["-c", &cmd])
@@ -79,18 +103,18 @@ async fn stream_response(format: StreamFormat) -> Response {
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
-    // The unfold state owns the child, so the pipeline lives as long as the
-    // response body; dropping it (client disconnect) drops the child →
-    // kill_on_drop tears down parec+ffmpeg.
+    // The unfold state owns the child AND the concurrency permit, so both live
+    // as long as the response body; dropping it (client disconnect) drops the
+    // child → kill_on_drop tears down parec+ffmpeg, and releases the permit.
     let body_stream = stream::unfold(
-        (BufReader::new(stdout), child),
-        |(mut reader, child)| async move {
+        (BufReader::new(stdout), child, permit),
+        |(mut reader, child, permit)| async move {
             let mut buf = vec![0u8; 8192];
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => None, // EOF / error -> end the stream
                 Ok(n) => {
                     buf.truncate(n);
-                    Some((Ok::<_, std::io::Error>(buf), (reader, child)))
+                    Some((Ok::<_, std::io::Error>(buf), (reader, child, permit)))
                 }
             }
         },
@@ -140,5 +164,27 @@ mod tests {
     fn content_types() {
         assert_eq!(StreamFormat::Aac.content_type(), "audio/aac");
         assert_eq!(StreamFormat::Mp3.content_type(), "audio/mpeg");
+    }
+
+    #[test]
+    fn stream_permit_granted_until_cap_then_503() {
+        // NF-37: the cap helper hands out exactly STREAM_MAX_CONCURRENT permits;
+        // the next acquire maps to a 503 without spawning anything.
+        let limit = Arc::new(Semaphore::new(STREAM_MAX_CONCURRENT));
+        let mut held = Vec::new();
+        for _ in 0..STREAM_MAX_CONCURRENT {
+            match acquire_stream_permit(&limit) {
+                Ok(p) => held.push(p),
+                Err(_) => panic!("permit under cap should be granted"),
+            }
+        }
+        match acquire_stream_permit(&limit) {
+            Ok(_) => panic!("over-cap acquire should be refused"),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE),
+        }
+
+        // Dropping a permit frees a slot again (proves Drop releases capacity).
+        held.pop();
+        assert!(acquire_stream_permit(&limit).is_ok());
     }
 }

@@ -2,3 +2,6 @@ target/release/soundsync                              usr/bin/
 webui/dist/*                                           usr/share/soundsync/webui/
 packaging/systemd/soundsync.service                    usr/lib/systemd/user/
 packaging/systemd/soundsync-adapter.service            usr/lib/systemd/system/
+packaging/systemd/soundsync-adapter-cod.service        usr/lib/systemd/system/
+packaging/soundsync-cod-watch.sh                       usr/lib/soundsync/
+packaging/default/soundsync                            etc/default/

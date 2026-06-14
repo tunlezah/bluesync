@@ -23,6 +23,7 @@ export interface AppStore {
   eq: EqInfo | null;
   spectrum: number[]; // latest 64-band frame
   output: OutputState | null;
+  deviceName: string;
   // Mutations
   setEq: (eq: EqInfo) => void;
   // WS client ref (for WebRTC signalling)
@@ -47,6 +48,7 @@ export function StoreProvider({ children }: Props) {
   const [eq, setEq] = useState<EqInfo | null>(null);
   const [spectrum, setSpectrum] = useState<number[]>([]);
   const [output, setOutput] = useState<OutputState | null>(null);
+  const [deviceName, setDeviceName] = useState('SoundSync');
   const wsRef = useRef<WsClient | null>(null);
   const [wsInstance, setWsInstance] = useState<WsClient | null>(null);
 
@@ -65,6 +67,7 @@ export function StoreProvider({ children }: Props) {
           setMedia(msg.data.media);
           if (msg.data.eq) setEq(msg.data.eq);
           if (msg.data.output) setOutput(msg.data.output);
+          if (msg.data.device_name) setDeviceName(msg.data.device_name);
           break;
         }
         case 'bluetooth_devices':
@@ -81,6 +84,9 @@ export function StoreProvider({ children }: Props) {
           break;
         case 'output_state':
           setOutput(msg.output);
+          break;
+        case 'device_name':
+          setDeviceName(msg.name);
           break;
         // webrtc_answer and webrtc_ice_candidate are handled by the webrtc module
         default:
@@ -108,6 +114,7 @@ export function StoreProvider({ children }: Props) {
     eq,
     spectrum,
     output,
+    deviceName,
     setEq: handleSetEq,
     ws: wsInstance,
   };

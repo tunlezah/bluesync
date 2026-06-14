@@ -327,4 +327,21 @@ mod tests {
         });
         assert_eq!(msg, Some(WsOutMessage::OutputState { output }));
     }
+
+    #[test]
+    fn output_state_serializes_cast_health_on_wire() {
+        // NF-8: cast_health rides the wholesale OutputState clone into the WS
+        // message and reaches the UI unchanged (snake_case, omitted when None).
+        use crate::state::{CastHealth, OutputState};
+        let m = WsOutMessage::OutputState {
+            output: OutputState {
+                active: None,
+                available: crate::output::AvailableOutputs::default(),
+                cast_health: Some(CastHealth::Lost),
+            },
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"type\":\"output_state\""));
+        assert!(json.contains("\"cast_health\":\"lost\""));
+    }
 }

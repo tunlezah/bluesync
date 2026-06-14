@@ -20,8 +20,23 @@ use axum::{Json, Router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{Duration, Instant};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
+
+/// WS keepalive interval: how often the server sends a Ping (NF-7).
+const WS_PING_INTERVAL: Duration = Duration::from_secs(15);
+/// WS idle deadline: if no inbound frame (Text/Binary/Ping/Pong/Close) arrives
+/// within this window the connection is considered half-open and torn down. Set
+/// to a little over 2× the ping interval so a single dropped Pong is tolerated.
+const WS_IDLE_DEADLINE: Duration = Duration::from_secs(35);
+
+/// Pure decision helper (NF-7): has the WS connection been idle past `deadline`?
+/// `last_seen` is the instant of the most recent inbound frame; `now` is the
+/// current instant. Returns true once the gap strictly exceeds `deadline`.
+fn ws_idle_timed_out(last_seen: Instant, now: Instant, deadline: Duration) -> bool {
+    now.saturating_duration_since(last_seen) > deadline
+}
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -50,6 +65,9 @@ pub struct WebContext {
     /// Process shutdown signal. Per-connection WS handlers observe it so an idle
     /// client cannot hang the graceful drain (W0.2).
     pub shutdown: watch::Receiver<bool>,
+    /// Bounds concurrent `/api/stream` parec|ffmpeg pipelines (NF-37). A permit
+    /// is held for the lifetime of each stream body; exhaustion returns 503.
+    pub stream_limit: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the router. `/api/status` returns the snapshot; `/ws/status` upgrades to
@@ -131,9 +149,28 @@ async fn ws_connection(mut socket: WebSocket, ctx: WebContext) {
             return;
         }
     }
+
+    // WS keepalive (NF-7): periodically Ping and enforce an idle deadline so a
+    // half-open client (TCP wedged but ICE nominally connected) is reaped via
+    // the existing Stop teardown rather than leaking the PC + Opus pump. Any
+    // inbound frame (Text/Binary/Ping/Pong/Close) refreshes `last_seen`.
+    let mut last_seen = Instant::now();
+    let mut keepalive = tokio::time::interval(WS_PING_INTERVAL);
+    // The first tick fires immediately; skip it so we don't Ping before the
+    // client has even settled.
+    keepalive.tick().await;
     loop {
         tokio::select! {
             _ = wait_for_shutdown(&mut shutdown) => break,
+            _ = keepalive.tick() => {
+                if ws_idle_timed_out(last_seen, Instant::now(), WS_IDLE_DEADLINE) {
+                    // Stale: break to the teardown path below (sends Stop).
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
             ev = events.recv() => match ev {
                 Ok(ev) => {
                     // Broadcast events (e.g. spectrum).
@@ -157,7 +194,11 @@ async fn ws_connection(mut socket: WebSocket, ctx: WebContext) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             incoming = socket.recv() => match incoming {
-                Some(Ok(Message::Text(t))) => {
+                Some(Ok(msg)) => {
+                    // Any inbound frame proves the peer is alive (NF-7).
+                    last_seen = Instant::now();
+                    match msg {
+                    Message::Text(t) => {
                     match serde_json::from_str::<WsInMessage>(&t) {
                         Ok(WsInMessage::WebrtcOffer { data }) => {
                             let (rtx, rrx) = oneshot::channel();
@@ -187,12 +228,19 @@ async fn ws_connection(mut socket: WebSocket, ctx: WebContext) {
                         }
                         Err(_) => { /* ignore parse errors */ }
                     }
+                    }
+                    Message::Close(_) => {
+                        let _ = ctx.webrtc_tx.send(WebRtcCommand::Stop { session }).await;
+                        return;
+                    }
+                    // Ping/Pong/Binary already refreshed `last_seen` above.
+                    _ => { /* ignore other message types */ }
+                    }
                 }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                None | Some(Err(_)) => {
                     let _ = ctx.webrtc_tx.send(WebRtcCommand::Stop { session }).await;
                     return;
                 }
-                Some(Ok(_)) => { /* ignore other message types */ }
             },
         }
     }
@@ -209,10 +257,106 @@ async fn ws_connection(mut socket: WebSocket, ctx: WebContext) {
 pub async fn serve(config: ServerConfig, ctx: WebContext) -> std::io::Result<()> {
     let mut shutdown = ctx.shutdown.clone();
     let app = router(ctx, config.web_dir);
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let listener = bind_with_retry(config.bind, &mut shutdown).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             wait_for_shutdown(&mut shutdown).await;
         })
         .await
+}
+
+/// Max bind attempts before giving up (NF-15).
+const BIND_MAX_ATTEMPTS: usize = 5;
+/// Delay between bind attempts (NF-15).
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Bind the listener, tolerating a transient `AddrInUse` after a fast restart
+/// (a still-exiting prior instance briefly holding the listening socket; NF-15).
+/// Retries up to [`BIND_MAX_ATTEMPTS`] with a short delay, racing each delay
+/// against shutdown so a SIGTERM mid-retry returns promptly. `SO_REUSEADDR` is
+/// deliberately NOT used: on Linux it does not let a second process steal a
+/// LISTENING socket still held by the old instance, so the bounded retry — not
+/// REUSEADDR — is the load-bearing fix. Non-`AddrInUse` errors fail immediately.
+async fn bind_with_retry(
+    addr: SocketAddr,
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let mut attempt = 0usize;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                attempt += 1;
+                if attempt >= BIND_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(BIND_RETRY_DELAY) => continue,
+                    _ = wait_for_shutdown(shutdown) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_idle_not_timed_out_within_deadline() {
+        let start = Instant::now();
+        let deadline = Duration::from_secs(35);
+        // Exactly at the deadline is NOT timed out (strictly-greater semantics).
+        assert!(!ws_idle_timed_out(start, start + deadline, deadline));
+        // Comfortably inside the window.
+        assert!(!ws_idle_timed_out(
+            start,
+            start + Duration::from_secs(10),
+            deadline
+        ));
+    }
+
+    #[test]
+    fn ws_idle_timed_out_past_deadline() {
+        let start = Instant::now();
+        let deadline = Duration::from_secs(35);
+        assert!(ws_idle_timed_out(
+            start,
+            start + deadline + Duration::from_millis(1),
+            deadline
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_with_retry_succeeds_on_free_port() {
+        let (_tx, mut rx) = watch::channel(false);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = bind_with_retry(addr, &mut rx).await.unwrap();
+        // Port 0 => the OS picked an ephemeral port; bind succeeded first try.
+        assert!(listener.local_addr().unwrap().port() != 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_with_retry_gives_up_after_max_attempts_on_addr_in_use() {
+        // Hold a real listener so the same addr is genuinely AddrInUse.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+        let (_tx, mut rx) = watch::channel(false);
+        let err = bind_with_retry(addr, &mut rx).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_with_retry_returns_promptly_on_shutdown_mid_retry() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+        let (tx, mut rx) = watch::channel(false);
+        // Signal shutdown before the call so the first retry sleep loses the race
+        // immediately and the function returns the AddrInUse error.
+        tx.send(true).unwrap();
+        let err = bind_with_retry(addr, &mut rx).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
 }

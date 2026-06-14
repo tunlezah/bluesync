@@ -296,8 +296,9 @@ export function DevicesTab() {
   const [pairDuration, setPairDuration] = useState(DEFAULT_PAIR_SECONDS);
   const [deviceCmdsAvailable, setDeviceCmdsAvailable] = useState(true);
 
-  // Infer device name from snapshot
-  const deviceName = store.snapshot?.version ? 'SoundSync' : 'SoundSync';
+  // Advertised device name from the store (live-updated via the `device_name` WS
+  // message); falls back to 'SoundSync' only when unknown.
+  const deviceName = store.deviceName || 'SoundSync';
 
   // Auto-close pairing banner when a device reaches connected/audio_active
   const prevDevicesRef = useRef(store.devices);

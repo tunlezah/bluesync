@@ -37,10 +37,47 @@ pub async fn ensure_null_sink<R: CommandRunner>(
     description: &str,
 ) -> Result<NullSink, String> {
     if let Some(id) = find_existing(runner, sink_name) {
-        return Ok(NullSink {
-            module_id: Some(id),
-            reused: true,
-        });
+        // A module record exists, but the record alone does not prove the sink
+        // NODE is live: WirePlumber (or a crash) can leave the module loaded
+        // while its node is gone (NF-6). Verify the node with the SAME
+        // `pactl list short sinks` check the create path uses below.
+        match runner.run("pactl", &["list", "short", "sinks"]) {
+            // Node present -> genuine reuse, exactly as before.
+            Ok(out) if out.success() && out.stdout.contains(sink_name) => {
+                return Ok(NullSink {
+                    module_id: Some(id),
+                    reused: true,
+                });
+            }
+            // Verified absent (command succeeded, sink not listed): the module
+            // is stale. Best-effort unload it, then fall through to the create
+            // path below so exactly one sink results.
+            Ok(out) if out.success() => {
+                eprintln!(
+                    "soundsync: null sink {sink_name} module {id} present but node missing; unloading stale module and recreating"
+                );
+                let _ = unload_module(runner, id);
+            }
+            // Could NOT verify (command failed/non-success OR errored, incl.
+            // NF-1's `TimedOut`): a transient pactl stall must not destroy a
+            // live sink, so KEEP the reused module rather than `?`-aborting
+            // bring-up. Self-heals on the next reconcile. (Note: NOT `?`.)
+            other => {
+                if let Err(e) = other {
+                    eprintln!(
+                        "soundsync: null sink {sink_name} module {id} reuse: could not verify node ({e}); keeping reused module"
+                    );
+                } else {
+                    eprintln!(
+                        "soundsync: null sink {sink_name} module {id} reuse: could not verify node (`pactl list short sinks` failed); keeping reused module"
+                    );
+                }
+                return Ok(NullSink {
+                    module_id: Some(id),
+                    reused: true,
+                });
+            }
+        }
     }
 
     let sink_arg = format!("sink_name={sink_name}");
@@ -171,8 +208,79 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reuses_existing_null_sink() {
+        // Module record exists AND the node is present in `list short sinks`
+        // (NF-6): genuine reuse, no load-module, no unload-module.
         let modules =
             "Module #7\n\tName: module-null-sink\n\tArgument: sink_name=soundsync-capture\n";
+        let runner = FakeCommandRunner::new()
+            .on("pactl", &["list", "modules"], ok(modules))
+            .on(
+                "pactl",
+                &["short", "sinks"],
+                ok("7\tsoundsync-capture\tPipeWire\tfloat32le 2ch 48000Hz\tSUSPENDED\n"),
+            );
+        let r = ensure_null_sink(&runner, "soundsync-capture", "SoundSync-Capture")
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            NullSink {
+                module_id: Some(7),
+                reused: true
+            }
+        );
+        // No load-module issued when reusing, and no unload of the live module.
+        assert!(!runner
+            .calls()
+            .iter()
+            .any(|(p, a)| p == "pactl" && a.iter().any(|x| x == "load-module")));
+        assert!(!runner
+            .calls()
+            .iter()
+            .any(|(p, a)| p == "pactl" && a.iter().any(|x| x == "unload-module")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reuse_with_missing_node_unloads_stale_and_recreates() {
+        // Module record exists (id 7) but the node is GONE from `short sinks`
+        // (verified absent): the module is stale -> unload it and recreate.
+        // The fake returns the SAME `short sinks` response for the post-create
+        // verify (identical args), so the recreated sink "does not appear" and
+        // the function returns the accurate did-not-appear Err. We assert on the
+        // SIDE EFFECTS that prove the stale module was unloaded and recreate was
+        // attempted, per the locked design.
+        let modules =
+            "Module #7\n\tName: module-null-sink\n\tArgument: sink_name=soundsync-capture\n";
+        let runner = FakeCommandRunner::new()
+            .on("pactl", &["list", "modules"], ok(modules))
+            // Node absent from the sink list (some OTHER sink is listed).
+            .on("pactl", &["short", "sinks"], ok("99\tother\n"))
+            .on("pactl", &["unload-module"], ok(""))
+            .on("pactl", &["load-module"], ok("42"));
+        let _ = ensure_null_sink(&runner, "soundsync-capture", "SoundSync-Capture").await;
+
+        // The stale module 7 was unloaded.
+        let unloaded_stale = runner.calls().iter().any(|(p, a)| {
+            p == "pactl" && a.iter().any(|x| x == "unload-module") && a.iter().any(|x| x == "7")
+        });
+        assert!(unloaded_stale, "stale module 7 should have been unloaded");
+        // The create path ran (recreate).
+        assert!(runner
+            .calls()
+            .iter()
+            .any(|(p, a)| p == "pactl" && a.iter().any(|x| x == "load-module")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reuse_keeps_reuse_when_node_verify_fails() {
+        // Module record exists (id 7) but the verify command cannot confirm the
+        // node (non-success / errored — the same arm NF-1's `TimedOut` Err hits):
+        // cannot verify -> KEEP the reused module. Crucially this must NOT abort
+        // bring-up and must NOT unload the (possibly live) module.
+        let modules =
+            "Module #7\n\tName: module-null-sink\n\tArgument: sink_name=soundsync-capture\n";
+        // No `short sinks` rule programmed -> the fake returns status 127
+        // (non-success), exercising the "could not verify" keep-reuse arm.
         let runner = FakeCommandRunner::new().on("pactl", &["list", "modules"], ok(modules));
         let r = ensure_null_sink(&runner, "soundsync-capture", "SoundSync-Capture")
             .await
@@ -184,7 +292,11 @@ mod tests {
                 reused: true
             }
         );
-        // No load-module issued when reusing.
+        // Kept reuse: neither unloaded the module nor attempted a recreate.
+        assert!(!runner
+            .calls()
+            .iter()
+            .any(|(p, a)| p == "pactl" && a.iter().any(|x| x == "unload-module")));
         assert!(!runner
             .calls()
             .iter()

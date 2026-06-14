@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'preact/hooks';
+import { useState, useCallback, useEffect } from 'preact/hooks';
 import { useStore } from '../lib/store';
 import { useTheme } from '../theme/ThemeContext';
 import { postSettingsName, postAdminRestart, postAdminIdentify, isNotFound } from '../lib/api';
@@ -66,9 +66,16 @@ function StreamLink({ label, url }: StreamLinkProps) {
 
 function RenameSection() {
   const { toast } = useToast();
-  const [name, setName] = useState('SoundSync');
+  const store = useStore();
+  const [name, setName] = useState(store.deviceName);
   const [pending, setPending] = useState(false);
   const [notAvailable, setNotAvailable] = useState(false);
+
+  // Re-seed the input when the device name changes elsewhere (other tab,
+  // reconnect snapshot, or a `device_name` WS push).
+  useEffect(() => {
+    setName(store.deviceName);
+  }, [store.deviceName]);
 
   const handleRename = useCallback(async () => {
     if (!name.trim()) return;

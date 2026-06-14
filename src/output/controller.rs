@@ -32,11 +32,11 @@
 //!   `spawn_blocking` (fixes the OUT-1 sync-block-on-async-runtime concern).
 //! - Biased `select!`: shutdown takes priority.
 
-use crate::cast::client::{start_cast, stream_url, CastHandle};
+use crate::cast::client::{start_cast, stream_url, CastSession};
 use crate::output::discovery::{parse_module_id_by_name, probe_outputs};
 use crate::output::loopback::{build_loopback_args, parse_loopback_module_id};
 use crate::output::{AvailableOutputs, OutputCommand, OutputDevice, OutputKind};
-use crate::state::{AppStateHandle, OutputState};
+use crate::state::{AppStateHandle, CastHealth, OutputState};
 use crate::sys::command::CommandRunner;
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,13 +186,17 @@ pub async fn run_output_controller<R>(
     let mut active: Option<OutputDevice> = None;
     let mut loopback_module_id: Option<u32> = None;
     // OUT-4b: tracks an active CASTV2 session (mutually exclusive with loopback).
-    let mut cast_handle: Option<CastHandle> = None;
+    // NF-8: the session carries the task's JoinHandle so we can detect it dying.
+    let mut cast_session: Option<CastSession> = None;
+    // NF-8: health of the active cast session, surfaced to the UI.
+    let mut cast_health: Option<CastHealth> = None;
 
     // Publish initial state.
     state
         .set_output(OutputState {
             active: active.clone(),
             available: available.clone(),
+            cast_health: cast_health.clone(),
         })
         .await;
 
@@ -218,11 +222,13 @@ pub async fn run_output_controller<R>(
 
                     Some(OutputCommand::None) => {
                         // Tear down any current loopback AND cast session, clear active.
-                        teardown(&runner, &mut loopback_module_id, &mut cast_handle).await;
+                        teardown(&runner, &mut loopback_module_id, &mut cast_session).await;
                         active = None;
+                        cast_health = None;
                         state.set_output(OutputState {
                             active: active.clone(),
                             available: available.clone(),
+                            cast_health: cast_health.clone(),
                         }).await;
                     }
 
@@ -230,7 +236,8 @@ pub async fn run_output_controller<R>(
                         // Tear down current (loopback + cast), load loopback to the chosen
                         // soundcard sink, then set active.  Shared logic with AirPlay via
                         // route_to_sink.
-                        teardown(&runner, &mut loopback_module_id, &mut cast_handle).await;
+                        teardown(&runner, &mut loopback_module_id, &mut cast_session).await;
+                        cast_health = None;
                         route_to_sink(
                             &runner,
                             &mut loopback_module_id,
@@ -243,6 +250,7 @@ pub async fn run_output_controller<R>(
                         state.set_output(OutputState {
                             active: active.clone(),
                             available: available.clone(),
+                            cast_health: cast_health.clone(),
                         })
                         .await;
                     }
@@ -251,7 +259,8 @@ pub async fn run_output_controller<R>(
                         // AirPlay routes identically to Soundcard: the RAOP PipeWire
                         // sinks created by module-raop-discover are regular sinks;
                         // routing is the same module-loopback mechanism.
-                        teardown(&runner, &mut loopback_module_id, &mut cast_handle).await;
+                        teardown(&runner, &mut loopback_module_id, &mut cast_session).await;
+                        cast_health = None;
                         route_to_sink(
                             &runner,
                             &mut loopback_module_id,
@@ -264,6 +273,7 @@ pub async fn run_output_controller<R>(
                         state.set_output(OutputState {
                             active: active.clone(),
                             available: available.clone(),
+                            cast_health: cast_health.clone(),
                         })
                         .await;
                     }
@@ -271,7 +281,8 @@ pub async fn run_output_controller<R>(
                     Some(OutputCommand::Select { kind: OutputKind::Chromecast, id }) => {
                         // OUT-4b: CASTV2 session routing.
                         // Teardown any current loopback/cast (single-active across all kinds).
-                        teardown(&runner, &mut loopback_module_id, &mut cast_handle).await;
+                        teardown(&runner, &mut loopback_module_id, &mut cast_session).await;
+                        cast_health = None;
 
                         // Find the device to get its IPv4 address and port.
                         let device = find_device(&available, &OutputKind::Chromecast, &id);
@@ -308,8 +319,11 @@ pub async fn run_output_controller<R>(
                                     active = None;
                                 } else {
                                     let url = stream_url(&lan_ip, bind_port);
-                                    let handle = start_cast(addr, port, url);
-                                    cast_handle = Some(handle);
+                                    let session = start_cast(addr, port, url);
+                                    cast_session = Some(session);
+                                    // NF-8: alive but unconfirmed until/unless the
+                                    // session task dies (then -> Lost on the tick).
+                                    cast_health = Some(CastHealth::Connecting);
                                     active = Some(dev);
                                 }
                             }
@@ -318,6 +332,7 @@ pub async fn run_output_controller<R>(
                         state.set_output(OutputState {
                             active: active.clone(),
                             available: available.clone(),
+                            cast_health: cast_health.clone(),
                         }).await;
                     }
                 }
@@ -329,11 +344,30 @@ pub async fn run_output_controller<R>(
                 if let Ok(fresh) = tokio::task::spawn_blocking(move || probe_outputs(&*r)).await {
                     available = fresh;
                 }
+
+                // NF-8: detect a dead cast session.  The session task `return`s on
+                // EOF / read-error / write-failure / the NF-26 inbound deadline.
+                // When that happens the watch::Sender inside the handle lingers and
+                // `active` would otherwise still show the (silent) device.  Clear
+                // active, drop the session, and surface health = Lost so the UI no
+                // longer reports a dead cast as active.  Re-selecting starts fresh.
+                if let Some(s) = &cast_session {
+                    if s.is_finished() {
+                        eprintln!(
+                            "soundsync/output: cast session ended — clearing active output"
+                        );
+                        cast_session = None;
+                        active = None;
+                        cast_health = Some(CastHealth::Lost);
+                    }
+                }
+
                 // If the active device is no longer in the discovered list, keep
                 // it in state (it may come back) — the UI can show it as stale.
                 state.set_output(OutputState {
                     active: active.clone(),
                     available: available.clone(),
+                    cast_health: cast_health.clone(),
                 }).await;
             }
         }
@@ -342,7 +376,7 @@ pub async fn run_output_controller<R>(
     // ── Shutdown teardown ─────────────────────────────────────────────────────
     //
     // 1. Tear down the active loopback AND any cast session.
-    teardown(&runner, &mut loopback_module_id, &mut cast_handle).await;
+    teardown(&runner, &mut loopback_module_id, &mut cast_session).await;
 
     // 2. Unload module-raop-discover so RAOP sinks don't linger after exit.
     //    Best-effort: log on failure, never propagate.
@@ -383,13 +417,15 @@ pub async fn run_output_controller<R>(
 async fn teardown<R>(
     runner: &Arc<R>,
     loopback_module_id: &mut Option<u32>,
-    cast_handle: &mut Option<CastHandle>,
+    cast_session: &mut Option<CastSession>,
 ) where
     R: CommandRunner + Send + Sync + 'static,
 {
     // Stop cast session first (non-blocking — just sends a watch signal).
-    if let Some(h) = cast_handle.take() {
-        h.stop();
+    // Taking the session out drops its JoinHandle too; we do NOT await the task
+    // (teardown stays non-blocking, matching the existing style).
+    if let Some(s) = cast_session.take() {
+        s.stop();
     }
     // Then tear down the PipeWire loopback (may spawn_blocking).
     teardown_loopback(runner, loopback_module_id).await;
@@ -1209,6 +1245,131 @@ mod tests {
             output.active.is_none(),
             "expected active=None when AirPlay loopback load-module fails"
         );
+    }
+
+    /// Build a runner that discovers exactly one Chromecast at `addr:port`.
+    ///
+    /// The avahi-browse line is in the parseable (`;`-separated) format
+    /// `parse_chromecasts` expects.  `load-module`/`unload-module` succeed and
+    /// `list short sinks` is empty so only the cast path is exercised.
+    fn runner_with_chromecast(addr: &str, port: u16, id: &str) -> Arc<SyncFakeCommandRunner> {
+        let avahi = format!(
+            "=;eth0;IPv4;Cast;_googlecast._tcp;local;host.local;{addr};{port};\
+             \"fn=Test Cast\" \"id={id}\"\n"
+        );
+        Arc::new(
+            SyncFakeCommandRunner::new()
+                .on(
+                    "avahi-browse",
+                    &["_googlecast._tcp"],
+                    CommandOutput {
+                        status: 0,
+                        stdout: avahi,
+                        stderr: String::new(),
+                    },
+                )
+                .on(
+                    "pactl",
+                    &["list", "short", "sinks"],
+                    CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                )
+                .on(
+                    "pactl",
+                    &["load-module"],
+                    CommandOutput {
+                        status: 0,
+                        stdout: "200\n".to_string(),
+                        stderr: String::new(),
+                    },
+                )
+                .on(
+                    "pactl",
+                    &["unload-module"],
+                    CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                ),
+        )
+    }
+
+    /// NF-8: a Chromecast whose session task dies must clear `active` and set
+    /// `cast_health = Lost` on the next refresh tick — the controller must no
+    /// longer report a dead cast as active.
+    ///
+    /// The session is made to die deterministically by casting to a refused port
+    /// (`127.0.0.1:1`): the TCP connect fails fast, so `run_cast_session`
+    /// returns and `CastSession::is_finished()` becomes true.  We then advance
+    /// virtual time past `REFRESH_INTERVAL` to fire the tick that observes it.
+    #[tokio::test(start_paused = true)]
+    async fn dead_cast_session_clears_active_on_tick() {
+        let id = "deadcast01";
+        let runner = runner_with_chromecast("127.0.0.1", 1, id);
+        let state = AppStateHandle::new();
+        // Subscribe BEFORE anything publishes so state transitions can be awaited
+        // deterministically (recv wakes on publish; immune to CPU contention),
+        // instead of a fragile fixed yield count that starves under build load.
+        let mut events = state.subscribe();
+        let (tx, rx) = mpsc::channel::<OutputCommand>(8);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let controller = tokio::spawn(run_output_controller(
+            rx,
+            runner,
+            state.clone(),
+            sd_rx,
+            "192.168.1.1".to_string(),
+            8080,
+        ));
+
+        // Select the Chromecast — start_cast spawns the doomed session task.
+        tx.send(OutputCommand::Select {
+            kind: OutputKind::Chromecast,
+            id: id.to_string(),
+        })
+        .await
+        .unwrap();
+
+        // Deterministically wait for active=Connecting (select succeeded + the
+        // doomed session task was spawned). recv() wakes on each state publish, so
+        // this never starves under CPU contention.
+        loop {
+            {
+                let out = state.snapshot().await.output;
+                if out.active.is_some() && out.cast_health == Some(CastHealth::Connecting) {
+                    break;
+                }
+            }
+            if let Err(tokio::sync::broadcast::error::RecvError::Closed) = events.recv().await {
+                panic!("event bus closed before the Chromecast became active (Connecting)");
+            }
+        }
+
+        // The doomed session task (TCP connect to :1) finishes near-instantly.
+        // Park on the event bus: while idle, start_paused auto-advances virtual
+        // time to the controller's next REFRESH_INTERVAL tick, which observes the
+        // finished session and publishes active=None + Lost. Deterministic — no
+        // fixed yield count, no manual time advance.
+        loop {
+            {
+                let out = state.snapshot().await.output;
+                if out.active.is_none() && out.cast_health == Some(CastHealth::Lost) {
+                    break;
+                }
+            }
+            if let Err(tokio::sync::broadcast::error::RecvError::Closed) = events.recv().await {
+                panic!("event bus closed before the dead session was cleared (Lost)");
+            }
+        }
+
+        // Drop the sender so the controller exits, then await it.
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), controller).await;
     }
 
     /// When `pactl load-module module-raop-discover` fails with non-zero status

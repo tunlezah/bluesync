@@ -24,3 +24,9 @@ override_dh_auto_install:
 
 override_dh_auto_test:
 	cargo test --release
+
+override_dh_fixperms:
+	dh_fixperms
+	# The CoD watcher source is 0664 in-repo and dh_fixperms does not add an
+	# execute bit to files under usr/lib; the unit's ExecStart needs it +x.
+	chmod 0755 debian/soundsync/usr/lib/soundsync/soundsync-cod-watch.sh
